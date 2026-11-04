@@ -202,6 +202,37 @@ test('historical binary-hash/base64 records retain their IDs and verify the stor
     assert.deepEqual(Buffer.from(hydrated.source, 'base64'), binary);
 });
 
+test('an explicit historical checksum preserves mismatched IDs and exact existing bytes', async () => {
+    const f = fixture();
+    const row = { sha256: hash('historical identity'), source: f.source };
+    const options = { ...f, expectedContentSha256: hash(f.source) };
+    assert.equal((await migrateLegacyProjectFile(row, { ...options, dryRun: true })).status, 'dry-run');
+    assert.deepEqual(f.calls, []);
+    const result = await migrateLegacyProjectFile(row, options);
+    assert.deepEqual(result, { status: 'migrated', sha256: row.sha256 });
+    assert.deepEqual(f.calls.map(call => call[0]), ['location', 'put', 'get', 'migrate']);
+    assert.deepEqual(f.calls[1][1].body, Buffer.from(f.source));
+    const values = f.calls[3][2];
+    assert.ok(values.includes(row.sha256));
+    assert.ok(values.includes(hash(f.source)));
+    assert.ok(values.includes(f.source));
+});
+
+test('historical checksum exceptions reject changed bytes and invalid IDs before any I/O', async () => {
+    for (const dryRun of [true, false]) {
+        const f = fixture();
+        for (const sha256 of [hash('old identity'), hash(f.source)]) {
+            await assert.rejects(migrateLegacyProjectFile({ sha256, source: f.source }, {
+                ...f, dryRun, expectedContentSha256: hash('previous bytes'),
+            }), /pinned SHA-256/);
+        }
+        await assert.rejects(migrateLegacyProjectFile({ sha256: 'invalid', source: f.source }, {
+            ...f, dryRun, expectedContentSha256: hash(f.source),
+        }), /Invalid legacy/);
+        assert.deepEqual(f.calls, []);
+    }
+});
+
 test('failed migration verification leaves inline data untouched', async () => {
     const f = fixture();
     f.objects.getObject = async () => ({ buffer: Buffer.from('wrong') });

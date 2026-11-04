@@ -182,6 +182,47 @@ test('CLI returns nonzero for item failures and closes the shared database', asy
     assert.match(errors[0], /checksum mismatch/);
 });
 
+test('the historical manifest pins only its named records in dry-run and apply', async () => {
+    for (const flag of ['--dry-run', '--apply']) {
+        const current = fixture(records(2));
+        const seen = [];
+        const code = await runMigrationCli([flag, '--legacy-hash-manifest', '/audited.json'], {
+            readManifest: async path => {
+                assert.equal(path, '/audited.json');
+                return JSON.stringify({ [sha(1)]: sha(99) });
+            },
+            load: async () => ({ db: current.db, migrate: async (row, options) => {
+                seen.push([row.sha256, options.expectedContentSha256]);
+                return { status: options.dryRun ? 'dry-run' : 'migrated', sha256: row.sha256 };
+            } }),
+            log: quiet,
+        });
+        assert.equal(code, 0);
+        assert.deepEqual(seen, [[sha(1), sha(99)], [sha(2), undefined]]);
+        assert.equal(current.disconnected, 1);
+    }
+});
+
+test('invalid or unreadable historical manifests fail before loading database dependencies', async () => {
+    for (const text of ['{', 'null', '[]', '"text"', '{"bad":"value"}', JSON.stringify({ [sha(1)]: 3 }),
+        JSON.stringify({ [sha(1)]: 'A'.repeat(64) })]) {
+        let loaded = false;
+        const code = await runMigrationCli(['--apply', '--legacy-hash-manifest', '/bad.json'], {
+            readManifest: async () => text,
+            load: async () => { loaded = true; }, log: quiet,
+        });
+        assert.equal(code, 1);
+        assert.equal(loaded, false);
+    }
+    let loaded = false;
+    assert.equal(await runMigrationCli(['--legacy-hash-manifest', '/missing.json'], {
+        readManifest: async () => { throw new Error('ENOENT'); },
+        load: async () => { loaded = true; }, log: quiet,
+    }), 1);
+    assert.equal(loaded, false);
+    assert.throws(() => parseMigrationOptions(['--legacy-hash-manifest']));
+});
+
 test('CLI returns nonzero on database errors and zero on a successful dry-run', async () => {
     const broken = fixture([]);
     broken.db.ow_projects_file.findMany = async () => { throw new Error('database unavailable'); };

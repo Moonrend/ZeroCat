@@ -149,11 +149,19 @@ export async function saveProjectFile(source, { userId = null, sha256, db = pris
 }
 
 /** Verified, restartable migration. Compare-and-swap never clears a concurrently changed body. */
-export async function migrateLegacyProjectFile(row, { db = prisma, objects = objectStorage, dryRun = false } = {}) {
+export async function migrateLegacyProjectFile(row, {
+    db = prisma, objects = objectStorage, dryRun = false, expectedContentSha256,
+} = {}) {
     if (!row || typeof row.source !== 'string') return { status: 'skipped', sha256: row?.sha256 };
+    if (!HASH_PATTERN.test(row.sha256)) throw new Error('Invalid legacy project file SHA-256');
     if (row.storage_provider && row.storage_provider !== 's3') throw new Error('Unknown project file storage provider');
     const { buffer, hash } = contentBytes(row.source);
-    if (hash !== row.sha256) {
+    // An audited manifest can pin existing bytes whose historical ID is not their hash.
+    // It never permits a changed body, even if the new body happens to match its ID.
+    if (expectedContentSha256 !== undefined && expectedContentSha256 !== hash) {
+        throw new Error('Legacy project file content does not match its pinned SHA-256');
+    }
+    if (hash !== row.sha256 && expectedContentSha256 !== hash) {
         // Historical sitemap rows use the compressed binary hash but store base64 text.
         const decoded = Buffer.from(row.source, 'base64');
         if (decoded.toString('base64') !== row.source || digest(decoded) !== row.sha256) {

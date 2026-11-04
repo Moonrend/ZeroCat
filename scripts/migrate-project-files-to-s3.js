@@ -1,6 +1,20 @@
 #!/usr/bin/env node
 
 import { pathToFileURL } from 'node:url';
+import { readFile } from 'node:fs/promises';
+
+export function parseLegacyHashManifest(text) {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('历史校验清单必须是文件ID到实际正文SHA256的JSON对象');
+    }
+    const entries = Object.entries(value);
+    if (entries.some(([id, hash]) => !/^[a-f0-9]{64}$/.test(id)
+        || typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash))) {
+        throw new Error('历史校验清单的文件ID和正文SHA256必须是64位小写十六进制字符串');
+    }
+    return new Map(entries);
+}
 
 const DEFAULTS = { dryRun: true, batchSize: 50, concurrency: 4, limit: null, after: null };
 
@@ -34,7 +48,8 @@ export function parseMigrationOptions(argv) {
         else if (arg === '--dry-run') dryRun = true;
         else if (arg === '--help' || arg === '-h') options.help = true;
         else {
-            const key = { '--batch-size': 'batchSize', '--concurrency': 'concurrency', '--limit': 'limit', '--after': 'after' }[arg];
+            const key = { '--batch-size': 'batchSize', '--concurrency': 'concurrency', '--limit': 'limit',
+                '--after': 'after', '--legacy-hash-manifest': 'legacyHashManifest' }[arg];
             if (!key) throw new Error(`未知参数: ${arg}`);
             const value = argv[++index];
             if (value === undefined || value.startsWith('--')) throw new Error(`${arg} 缺少参数值`);
@@ -46,7 +61,9 @@ export function parseMigrationOptions(argv) {
 }
 
 // Storage details and source clearing belong to migrateLegacyProjectFile.
-export async function migrateProjectFiles({ db, migrate, select, options = {}, onProgress = () => {}, onError = () => {} }) {
+export async function migrateProjectFiles({
+    db, migrate, select, options = {}, legacyContentHashes = new Map(), onProgress = () => {}, onError = () => {},
+}) {
     const config = normalizeOptions(options);
     let cursor = config.after;
     const summary = {
@@ -72,7 +89,8 @@ export async function migrateProjectFiles({ db, migrate, select, options = {}, o
                 const index = nextIndex++;
                 const row = rows[index];
                 try {
-                    const result = await migrate(row, { db, dryRun: config.dryRun });
+                    const result = await migrate(row, { db, dryRun: config.dryRun,
+                        expectedContentSha256: legacyContentHashes.get(row.sha256) });
                     if (result?.sha256 !== row.sha256 || !['migrated', 'skipped', 'dry-run'].includes(result.status)) {
                         throw new Error('正文存储服务返回了无效迁移结果');
                     }
@@ -109,6 +127,7 @@ const HELP = `迁移项目正文到私有 S3（默认仅预演）
   --concurrency N    同时处理的记录数，1-32，默认 4
   --limit N          本次最多检查的记录数（包括失败和跳过）
   --after SHA256     从该 SHA256 之后继续，使用上次 apply 的 resumeAfter
+  --legacy-hash-manifest PATH  已核对的旧文件ID与实际正文SHA256的JSON清单
   --help, -h         显示帮助
 
 失败记录会保留原文并逐条记录。失败时退出码为 1。
@@ -122,7 +141,9 @@ async function loadDependencies() {
     return { db: prisma, migrate: migrateLegacyProjectFile, select: PROJECT_FILE_SELECT };
 }
 
-export async function runMigrationCli(argv, { load = loadDependencies, log = console } = {}) {
+export async function runMigrationCli(argv, {
+    load = loadDependencies, log = console, readManifest = path => readFile(path, 'utf8'),
+} = {}) {
     let dependencies;
     try {
         const options = parseMigrationOptions(argv);
@@ -130,10 +151,14 @@ export async function runMigrationCli(argv, { load = loadDependencies, log = con
             log.log(HELP);
             return 0;
         }
+        const legacyContentHashes = options.legacyHashManifest === undefined ? new Map()
+            : parseLegacyHashManifest(await readManifest(options.legacyHashManifest));
+        if (legacyContentHashes.size) log.log(`[project-files] 已载入历史内容校验清单：${legacyContentHashes.size} 条`);
         dependencies = await load();
         const summary = await migrateProjectFiles({
             ...dependencies,
             options,
+            legacyContentHashes,
             onProgress: progress => log.log(`[project-files] ${JSON.stringify(progress)}`),
             onError: ({ sha256, error }) => log.error(`[project-files] ${sha256}: ${error.message}`),
         });

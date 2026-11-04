@@ -65,6 +65,12 @@ docker compose exec -T zerocat sh -c 'cd /app && pnpm run migrate:project-files 
 docker compose exec -T zerocat sh -c 'cd /app && pnpm run migrate:project-files --apply --batch-size 50 --concurrency 4'
 ```
 
+## 历史 ID 与正文哈希不一致
+
+默认拒绝无法用普通正文或旧 Base64 规则验证的记录。若预演发现已有历史 ID 与正文不一致，应先备份数据库，核对当前正文及其项目引用，然后保存一份 JSON 清单：键为旧文件的 64 位小写 ID，值为已核对正文 UTF-8 字节的 64 位小写 SHA-256。清单不包含正文，不写入镜像或仓库，随备份保留。
+
+通过 `--legacy-hash-manifest /path/to/audited-hashes.json` 同时传给预演和正式迁移。仅列出的 ID 可以使用指定的实际内容哈希；实际正文与清单不符时，在上传前失败。仍保留旧 ID，上传并回读完整字节，再按原正文和存储指针做条件更新。未列出的记录继续执行默认校验，新文件写入规则不变。容器运行时需只读挂载清单，或显式复制到迁移容器。
+
 ## 重跑与失败处理
 
 查询只选择 `source IS NOT NULL` 的记录，空字符串正文也会处理。已完成迁移的记录会自动排除，因此可以直接重跑同一条 `--apply` 命令；不需要手动维护已完成清单。
