@@ -4,9 +4,20 @@ import assert from 'node:assert/strict';
 const state = {};
 const noop = () => {};
 mock.module('./logger.js', { defaultExport: { info: noop, warn: noop, error: noop, debug: noop } });
-mock.module('./config/zcconfig.js', { defaultExport: { get: async () => '' } });
-mock.module('@aws-sdk/client-s3', { namedExports: {
-    S3Client: class { async send() { state.s3Writes++; } }, PutObjectCommand: class {}, GetObjectCommand: class {},
+mock.module('./config/zcconfig.js', { defaultExport: { get: async key => ({
+    's3.bucket': 'public-assets', 's3.staticurl': 'https://assets.example.test',
+})[key] || '' } });
+mock.module('./objectStorage.js', { namedExports: {
+    async putObject(input) {
+        state.s3Writes++;
+        state.objectWrites.push(input);
+        if (state.storageError) throw state.storageError;
+    },
+    async getObject(input) {
+        state.objectReads.push(input);
+        if (state.storageError) throw state.storageError;
+        return state.objectResult;
+    },
 } });
 mock.module('sharp', { defaultExport: () => { state.imageReads++; throw new Error('Unexpected image processing'); } });
 mock.module('fluent-ffmpeg', { defaultExport: () => { throw new Error('Unexpected audio processing'); } });
@@ -24,6 +35,7 @@ mock.module('./moderation/visibility.js', { namedExports: {
     },
     canViewContent: async () => state.visible,
     sanitizeProfile: async () => state.profileVisible ? { id: 3 } : null,
+    sanitizeProfiles: async users => users.map(user => state.profileVisible ? user : null),
     visibleWhere: async () => ({ uploader_id: { notIn: [8] } }),
 } });
 mock.module('./prisma.js', { namedExports: { prisma: { ow_assets: {
@@ -31,13 +43,32 @@ mock.module('./prisma.js', { namedExports: { prisma: { ow_assets: {
     create: async ({ data }) => { state.created.push(data); return data; },
     findMany: async query => { state.listQueries.push(query); return [{ id: 7, uploader: { id: 3 } }]; },
     count: async query => { state.countQueries.push(query); return 1; },
+    groupBy: async query => { state.groupQueries.push(query); return state.groups; },
 } } } });
-const { uploadFile, processSimpleImageUpload, createAssetRecord, getAssetsList } = await import('./assets.js');
+const { uploadFile, processSimpleImageUpload, createAssetRecord, getAssetsList, getAssetStats,
+    uploadToS3, downloadFromS3 } = await import('./assets.js');
 const file = { buffer: Buffer.from('sample'), originalname: 'sample.wav', detectedMimeType: 'audio/wav', detectedExtension: 'wav' };
 const res = (scopes = ['asset:create']) => ({ locals: { userid: 3, tokenType: 'oauth', scopes } });
 beforeEach(() => Object.assign(state, { readonly: false, visible: true, profileVisible: true,
     imageReads: 0, fileReads: 0, s3Writes: 0, assetReads: 0, created: [], guards: [], authorizations: [],
-    listQueries: [], countQueries: [], asset: { id: 7, uploader_id: 3, md5: 'test' } }));
+    listQueries: [], countQueries: [], groupQueries: [], groups: [], asset: { id: 7, uploader_id: 3, md5: 'test' },
+    objectWrites: [], objectReads: [], storageError: null,
+    objectResult: { buffer: Buffer.from('asset'), contentType: 'image/png', contentLength: 5 } }));
+
+test('shared storage keeps public asset ACL, static URL and download metadata', async () => {
+    const buffer = Buffer.from('asset');
+    assert.equal(await uploadToS3(buffer, 'assets/file.png', 'image/png'), 'https://assets.example.test/assets/file.png');
+    assert.deepEqual(state.objectWrites, [{ bucket: 'public-assets', key: 'assets/file.png', body: buffer,
+        contentType: 'image/png', acl: 'public-read' }]);
+    assert.equal(await downloadFromS3('assets/file.png'), state.objectResult);
+    assert.deepEqual(state.objectReads, [{ bucket: 'public-assets', key: 'assets/file.png' }]);
+});
+
+test('asset storage failures remain visible to callers', async () => {
+    state.storageError = Object.assign(new Error('AccessDenied'), { status: 403 });
+    await assert.rejects(uploadToS3(Buffer.from('asset'), 'key', 'image/png'), error => error === state.storageError);
+    await assert.rejects(downloadFromS3('key'), error => error === state.storageError);
+});
 
 test('readonly uploads fail before deduplication, file processing, or external writes', async () => {
     state.readonly = true;
@@ -70,6 +101,20 @@ test('direct asset records recheck readonly before database creation', async () 
     state.readonly = true;
     await assert.rejects(createAssetRecord({ uploaderId: 3 }), { code: 'ACCOUNT_READ_ONLY' });
     assert.deepEqual(state.created, []);
+});
+
+test('asset totals reuse visible category aggregates including null category and empty sums', async () => {
+    state.groups = [
+        { category: 'image', _count: { id: 3 }, _sum: { file_size: 40 } },
+        { category: null, _count: { id: 2 }, _sum: { file_size: null } },
+    ];
+    const result = await getAssetStats(9);
+    assert.equal(result.totalAssets, 5);
+    assert.equal(result.totalSize, 40);
+    assert.deepEqual(state.groupQueries[0].where, { uploader_id: { notIn: [8] } });
+    assert.equal(state.countQueries.length, 0);
+    state.groups = [];
+    assert.deepEqual(await getAssetStats(9), { totalAssets: 0, totalSize: 0, byCategory: [] });
 });
 
 test('asset pagination filters before count and redacts a hidden uploader profile', async () => {

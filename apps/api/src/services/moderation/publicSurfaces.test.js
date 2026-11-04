@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { beforeEach, mock, test } from 'node:test';
+import { createHash } from 'node:crypto';
 
 const state = {};
 const url = path => new URL(path, import.meta.url).href;
@@ -11,6 +12,9 @@ const prisma = {
     },
     async $transaction(work) { return Array.isArray(work) ? Promise.all(work) : work(prisma); },
     ow_users: { async findMany() { return []; } },
+    ow_user_restrictions: { async findMany({ where }) {
+        return state.hiddenProfile ? where.user_id.in.map(user_id => ({ user_id })) : [];
+    } },
     ow_projects: {
         async findMany() { return []; },
         async findFirst(query) { state.projectReads.push(query); return state.featuredProject; },
@@ -44,6 +48,7 @@ mock.module(url('./visibility.js'), { namedExports: {
     async visibleSql(kind, alias) { return { text: `${alias}.moderation_guard = $1`, values: [777] }; },
     async canViewContent(kind, record) { return Boolean(record) && !state.hidden && !(kind === 'profile' && state.hiddenProfile); },
     async sanitizePublicUser(user) { return user; },
+    async sanitizeProfiles(users) { return users.map(user => state.hiddenProfile ? null : user); },
     async assertCanWrite(userId, category, action) {
         state.guards.push({ userId, category, action });
         if (state.readonly) throw Object.assign(new Error('readonly'), { statusCode: 403, code: 'ACCOUNT_READ_ONLY' });
@@ -65,6 +70,11 @@ mock.module(url('../commentService/notify/notifyContext.js'), { namedExports: {
 } });
 mock.module(url('../commentService/notify/providers/index.js'), { namedExports: {
     getEnabledProviders() { return [{ name: 'test', async send() { state.sent++; return { success: true }; } }]; },
+} });
+mock.module(url('../projectFileStorage.js'), { namedExports: {
+    async readProjectFile() { return null; },
+    async hydrateProjectFile(row) { return row; },
+    async saveProjectFile(source) { return { sha256: createHash('sha256').update(source).digest('hex') }; },
 } });
 mock.module(url('../gorse.js'), { defaultExport: {} });
 mock.module(url('../global.js'), { namedExports: { validateUsername() { return { valid: true }; } } });

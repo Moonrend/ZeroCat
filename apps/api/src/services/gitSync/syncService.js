@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import logger from '../logger.js';
 import { prisma } from '../prisma.js';
+import { readProjectFile } from '../projectFileStorage.js';
 import zcconfig from '../config/zcconfig.js';
 import { downloadFromS3 } from '../assets.js';
 import { createNotification } from '../../controllers/notifications.js';
@@ -370,10 +371,7 @@ const gitSyncService = {
 
             const branch = safeBranchName(settings.branch || repo.default_branch || project.default_branch || 'main', 'main');
 
-            const fileRecord = await prisma.ow_projects_file.findFirst({
-                where: { sha256: commit.commit_file },
-                select: { source: true },
-            });
+            const fileRecord = await readProjectFile(commit.commit_file);
             const sourceContent = buildProjectFileContent(fileRecord?.source, {
                 formatJson: isScratchLikeType(project.type),
             });

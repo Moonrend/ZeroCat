@@ -42,6 +42,17 @@ function fixture(seed = {}) {
                     calls.push({ model, method: "count", ...args });
                     return data[model].filter((row) => matches(row, args.where)).length;
                 },
+                async groupBy(args) {
+                    calls.push({ model, method: "groupBy", ...args });
+                    const groups = new Map();
+                    for (const row of data[model].filter(row => matches(row, args.where))) {
+                        const values = Object.fromEntries(args.by.map(field => [field, row[field]]));
+                        const key = JSON.stringify(values);
+                        if (!groups.has(key)) groups.set(key, { ...values, _count: { _all: 0 } });
+                        groups.get(key)._count._all++;
+                    }
+                    return [...groups.values()];
+                },
                 async updateMany(args) {
                     calls.push({ model, method: "updateMany", ...structuredClone(args) });
                     const rows = data[model].filter((row) => matches(row, args.where));
@@ -257,6 +268,23 @@ test("interactions remove outgoing records only and recompute surviving post/pro
     assert.equal(data.ow_projects[0].star_count, 1);
     assert.equal(data.ow_user_relationships[0].source_user_id, 2);
     assert.equal(data.ow_tokens.length, 1);
+});
+
+test("post reconciliation batches counts and preserves quote/retweet distinctions", async () => {
+    const { db, data, calls } = fixture({
+        ow_posts: [post(10, 2), post(20, 2),
+            post(30, 3, { post_type: "retweet", retweet_post_id: 10, quoted_post_id: 20 }),
+            post(31, 3, { post_type: "quote", quoted_post_id: 10 }),
+            post(32, 3, { post_type: "reply", in_reply_to_id: 20 }),
+            post(33, 3, { post_type: "quote", quoted_post_id: 20, is_deleted: true })],
+        ow_posts_like: [{ id: 1, user_id: 1, post_id: 10 }, { id: 2, user_id: 1, post_id: 20 }],
+    });
+    await cleanupUserData(db, 1, ["interactions"]);
+    assert.equal(data.ow_posts[0].retweet_count, 2);
+    assert.equal(data.ow_posts[1].retweet_count, 0);
+    assert.equal(data.ow_posts[1].reply_count, 1);
+    assert.equal(calls.filter(call => call.method === "groupBy").length, 4);
+    assert.equal(calls.some(call => call.method === "count" && call.where?.in_reply_to_id !== undefined), false);
 });
 
 test("post plus interaction cleanup reconciles the final combined graph", async () => {

@@ -28,16 +28,15 @@ const resolveUserByIdentifier = async (identifier) => {
     if (!identifier) return null;
     let user = null;
     if (emailTest(identifier)) {
-        const contact = await prisma.ow_users_contacts.findFirst({
+        user = await prisma.ow_users.findFirst({
             where: {
-                contact_value: identifier,
-                contact_type: "email",
-                OR: [{is_primary: true}, {verified: true}],
+                contacts: { some: {
+                    contact_value: identifier,
+                    contact_type: "email",
+                    OR: [{ is_primary: true }, { verified: true }],
+                } },
             },
         });
-        if (contact) {
-            user = await prisma.ow_users.findUnique({where: {id: contact.user_id}});
-        }
     }
     if (!user) {
         user = await prisma.ow_users.findFirst({where: {username: identifier}});
@@ -49,14 +48,12 @@ const resolveUserByIdentifier = async (identifier) => {
  * 获取用户用于接收验证码/链接的邮箱（主邮箱优先，其次任一已验证邮箱）
  */
 const getUserDeliveryEmail = async (userId) => {
-    const primary = await prisma.ow_users_contacts.findFirst({
-        where: {user_id: userId, contact_type: "email", is_primary: true, verified: true},
+    const contact = await prisma.ow_users_contacts.findFirst({
+        where: { user_id: userId, contact_type: "email", verified: true },
+        orderBy: { is_primary: "desc" },
+        select: { contact_value: true },
     });
-    if (primary?.contact_value) return primary.contact_value;
-    const verified = await prisma.ow_users_contacts.findFirst({
-        where: {user_id: userId, contact_type: "email", verified: true},
-    });
-    return verified?.contact_value || null;
+    return contact?.contact_value || null;
 };
 
 /**
@@ -85,35 +82,7 @@ export const loginWithPassword = async (req, res, next) => {
             });
         }
 
-        // 查找用户
-        let user = null;
-
-        if (emailTest(loginId)) {
-            // 查找主邮箱或已验证的邮箱联系方式
-            const contact = await prisma.ow_users_contacts.findFirst({
-                where: {
-                    contact_value: loginId,
-                    contact_type: "email",
-                    OR: [
-                        {is_primary: true}, // 主邮箱
-                        {verified: true}, // 或已验证的邮箱
-                    ],
-                },
-            });
-
-            if (contact) {
-                user = await prisma.ow_users.findFirst({
-                    where: {id: contact.user_id},
-                });
-            }
-        }
-
-        // 如果通过邮箱没找到，尝试通过用户名查找
-        if (!user) {
-            user = await prisma.ow_users.findFirst({
-                where: {username: loginId},
-            });
-        }
+        const user = await resolveUserByIdentifier(loginId);
 
         if (!user) {
             await redisClient.set(attemptKey, attempts + 1, 900); // 15分钟过期
@@ -149,34 +118,24 @@ export const loginWithPassword = async (req, res, next) => {
             });
         }
 
-        // 获取用户的主要邮箱联系方式
-        const primaryEmail = await prisma.ow_users_contacts.findFirst({
+        const deliveryEmail = await prisma.ow_users_contacts.findFirst({
             where: {
                 user_id: user.id,
                 contact_type: "email",
-                is_primary: true,
+                OR: [{ is_primary: true }, { verified: true }],
             },
+            orderBy: { is_primary: "desc" },
+            select: { contact_value: true },
         });
 
-        // 如果没有主要邮箱，获取任何已验证的邮箱
-        const verifiedEmail = !primaryEmail
-            ? await prisma.ow_users_contacts.findFirst({
-                where: {
-                    user_id: user.id,
-                    contact_type: "email",
-                    verified: true,
-                },
-            })
-            : null;
-
-        if (!primaryEmail && !verifiedEmail) {
+        if (!deliveryEmail) {
             return res.status(200).json({
                 status: "error",
                 message: "请先验证邮箱",
             });
         }
 
-        const userEmail = primaryEmail?.contact_value || verifiedEmail?.contact_value;
+        const userEmail = deliveryEmail.contact_value;
 
         // 获取标准化的用户信息
         const userInfo = await tokenUtils.getUserInfoForToken(user, userEmail);
@@ -542,38 +501,14 @@ export const validateMagicLinkAndLogin = async (req, res) => {
             }
         }
 
-        // 获取用户的主要邮箱联系方式
-        const primaryEmail = await prisma.ow_users_contacts.findFirst({
-            where: {
-                user_id: user.id,
-                contact_type: "email",
-                is_primary: true,
-                verified: true,
-            },
-        });
+        const userEmail = await getUserDeliveryEmail(user.id);
 
-        // 如果没有已验证的主要邮箱，尝试获取任何已验证的邮箱
-        const verifiedEmail = !primaryEmail
-            ? await prisma.ow_users_contacts.findFirst({
-                where: {
-                    user_id: user.id,
-                    contact_type: "email",
-                    verified: true,
-                },
-            })
-            : null;
-
-        if (!primaryEmail && !verifiedEmail) {
+        if (!userEmail) {
             return res.status(200).json({
                 status: "error",
                 message: "请先验证邮箱",
             });
         }
-
-        const userEmail =
-            primaryEmail?.contact_value ||
-            verifiedEmail?.contact_value ||
-            validateResult.email;
 
         // 获取标准化的用户信息
         const userInfo = await tokenUtils.getUserInfoForToken(user, userEmail);

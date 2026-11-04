@@ -51,23 +51,10 @@ async function privateResourceWhere(kind, viewerId, db) {
     if (!viewerId) return { OR: alternatives };
     const id = Number(viewerId);
     alternatives.push({ [owner]: id });
-    const [roles, permissions] = await Promise.all([
-        db.ow_user_roles.findMany({ where: { user_id: id, target_type: kind,
-            OR: [{ expires_at: null }, { expires_at: { gt: new Date() } }] }, select: { target_id: true } }),
-        db.ow_user_permissions.findMany({ where: { user_id: id, target_type: kind, effect: "allow",
-            OR: [{ expires_at: null }, { expires_at: { gt: new Date() } }] }, select: { target_id: true } }),
-    ]);
-    const { getUserPolicy, resourcePolicyAllowsScope } = await import("../auth/policyEngine.js");
-    const { parseScope } = await import("../auth/scopes.js");
-    const globalPolicy = await getUserPolicy(id, { db });
-    const concreteIds = (globalPolicy.sources || []).filter((source) => source.effect === "allow")
-        .map((source) => parseScope(source.scope)).filter((scope) => scope?.resource === kind && scope.id !== null)
-        .map((scope) => scope.id);
-    const candidates = [...new Set([...roles.map((row) => row.target_id), ...permissions.map((row) => row.target_id), ...concreteIds]
-        .map(Number).filter((value) => Number.isSafeInteger(value) && value > 0))];
+    const { getUserResourcePolicies, resourcePolicyAllowsScope } = await import("../auth/policyEngine.js");
+    const policies = await getUserResourcePolicies(id, kind, { db });
     const allowed = [];
-    for (const candidate of candidates) {
-        const policy = await getUserPolicy(id, { db, targetType: kind, targetId: String(candidate) });
+    for (const [candidate, policy] of policies) {
         if (resourcePolicyAllowsScope(policy, `${kind}:${candidate}:read`)) allowed.push(candidate);
     }
     if (allowed.length) alternatives.push({ id: { in: allowed } });
@@ -83,11 +70,19 @@ function singleItemShadowWhere(owner, viewerId, now) {
 }
 
 export async function visibleWhere(kind, viewerId = null, options = {}) {
+    return buildVisibleWhere(kind, viewerId, options, new Map());
+}
+
+async function buildVisibleWhere(kind, viewerId, options, ownerQueries) {
     const config = kindDefinition(kind);
     if (reviewer(options)) return {};
     const db = options.db || prisma;
-    if (kind === "extension") return { AND: [{ project: { is: await visibleWhere("project", viewerId, options) } },
-        { project: { is: ownerFilter("authorid", await hiddenOwners("extensions", viewerId, db), KINDS.project.nullableOwner) } }] };
+    const ownersFor = (category) => {
+        if (!ownerQueries.has(category)) ownerQueries.set(category, hiddenOwners(category, viewerId, db));
+        return ownerQueries.get(category);
+    };
+    if (kind === "extension") return { AND: [{ project: { is: await buildVisibleWhere("project", viewerId, options, ownerQueries) } },
+        { project: { is: ownerFilter("authorid", await ownersFor("extensions"), KINDS.project.nullableOwner) } }] };
     const now = options.now || new Date();
     const clauses = [];
     if (["project", "list"].includes(kind) && !options.ignorePrivacy) clauses.push(await privateResourceWhere(kind, viewerId, db));
@@ -96,23 +91,23 @@ export async function visibleWhere(kind, viewerId = null, options = {}) {
     if (["post", "project"].includes(kind)) clauses.push(singleItemShadowWhere(config.owner, viewerId, now));
     if (kind === "project") {
         const [projects, blog] = await Promise.all([
-            hiddenOwners("projects", viewerId, db), hiddenOwners("blog", viewerId, db),
+            ownersFor("projects"), ownersFor("blog"),
         ]);
         clauses.push({ OR: [
             { AND: [{ type: "article" }, ownerFilter(config.owner, [...new Set([...projects, ...blog])], config.nullableOwner)] },
             { AND: [{ OR: [{ type: null }, { type: { not: "article" } }] }, ownerFilter(config.owner, projects, config.nullableOwner)] },
         ] });
     } else {
-        clauses.push(ownerFilter(config.owner, await hiddenOwners(options.category || config.category, viewerId, db), config.nullableOwner));
+        clauses.push(ownerFilter(config.owner, await ownersFor(options.category || config.category), config.nullableOwner));
     }
     if (kind === "relation") {
-        clauses.push(ownerFilter("target_user_id", await hiddenOwners("profile", viewerId, db), true));
+        clauses.push(ownerFilter("target_user_id", await ownersFor("profile"), true));
     }
     if (kind === "post" && options.reference) clauses.push({ post_type: { not: "retweet" } });
     if (kind === "post" && !options.reference) {
         clauses.push({ OR: [
             { post_type: { not: "retweet" } },
-            { retweet_post: { is: await visibleWhere("post", viewerId, { ...options, reference: true }) } },
+            { retweet_post: { is: await buildVisibleWhere("post", viewerId, { ...options, reference: true }, ownerQueries) } },
         ] });
     }
     return { AND: clauses };
@@ -220,6 +215,29 @@ export async function sanitizePublicUser(user, viewerId = null, options = {}) {
 }
 
 export const sanitizeProfile = sanitizePublicUser;
+
+/** Sanitize a page of profiles with fresh, bounded restriction reads. Keeps input positions. */
+export async function sanitizeProfiles(users, viewerId = null, options = {}) {
+    if (reviewer(options)) return users.map(user => user || null);
+    const db = options.db || prisma;
+    const candidates = [...new Set(users.filter(Boolean).map(user => Number(user.id))
+        .filter(id => id && (!viewerId || id !== Number(viewerId))))];
+    const hidden = new Set();
+    for (let start = 0; start < candidates.length; start += 500) {
+        const rules = await db.ow_user_restrictions.findMany({
+            where: { user_id: { in: candidates.slice(start, start + 500) },
+                ...activeRestrictionWhere("shadowban"),
+                categories: { hasSome: ["*", options.category || "profile"] } },
+            select: { user_id: true },
+        });
+        for (const rule of rules) hidden.add(rule.user_id);
+    }
+    return users.map(user => {
+        if (!user || user.deleted_at) return null;
+        if (viewerId && Number(user.id) === Number(viewerId)) return user;
+        return contentIsShadowbanned(user, options.now) || hidden.has(Number(user.id)) ? null : user;
+    });
+}
 
 export async function assertPubliclyVisible(kind, record, viewerId = null, options = {}) {
     if (!await canViewContent(kind, record, viewerId, options)) {

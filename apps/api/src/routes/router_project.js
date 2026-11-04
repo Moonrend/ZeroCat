@@ -35,7 +35,9 @@ import {
   updateBranchLatestCommit,
 } from "../services/commitService.js";
 
-import { visibleWhere, sanitizeProfile } from "../services/moderation/visibility.js";
+import { visibleWhere, sanitizeProfile, sanitizeProfiles } from "../services/moderation/visibility.js";
+import { readProjectFile, saveProjectFile } from "../services/projectFileStorage.js";
+import { findReachableProjectCommit, listReachableCommitIds } from "../services/projectCommitAccess.js";
 import { assertCanWrite } from "../services/moderation/restrictions.js";
 import { softDeleteContent, restoreContent } from "../services/moderation/lifecycle.js";
 
@@ -89,24 +91,7 @@ const issueProjectFileAccessToken = (sha256, userid, projectId, staged = false) 
   action: "read", sha256, userid, project_id: Number(projectId), staged,
 }, 300);
 
-async function findReachableCommit(projectId, { commitId = null, sha256 = null } = {}) {
-  const branches = await prisma.ow_projects_branch.findMany({
-    where: { projectid: Number(projectId) },
-    select: { latest_commit_hash: true },
-  });
-  const pending = branches.map((branch) => branch.latest_commit_hash).filter(Boolean);
-  const visited = new Set();
-  while (pending.length && visited.size < 10000) {
-    const id = pending.shift();
-    if (visited.has(id)) continue;
-    visited.add(id);
-    const commit = await prisma.ow_projects_commits.findUnique({ where: { id } });
-    if (!commit) continue;
-    if ((commitId && commit.id === commitId) || (sha256 && commit.commit_file === sha256)) return commit;
-    if (commit.parent_commit_id) pending.push(commit.parent_commit_id);
-  }
-  return null;
-}
+const findReachableCommit = (projectId, options = {}) => findReachableProjectCommit(projectId, options);
 
 const resolveProjectInitType = (projectType) => {
   if (projectType && default_project[projectType]) return projectType;
@@ -120,11 +105,6 @@ const initializeEmptyProject = async (tx, { projectId, userId, projectType }) =>
   if (!defaultSource) {
     throw new Error(`Default project template not found for type: ${initType}`);
   }
-
-  const commitCount = await tx.ow_projects_commits.count({
-    where: { project_id: Number(projectId) },
-  });
-  if (commitCount > 0) return null;
 
   const timestamp = new Date();
   const commitContent = JSON.stringify({
@@ -160,11 +140,6 @@ const initializeEmptyProject = async (tx, { projectId, userId, projectType }) =>
       commit_date: new Date(timestamp),
       commit_description: "# 初始化提交",
     },
-  });
-
-  await tx.ow_projects.update({
-    where: { id: Number(projectId) },
-    data: { default_branch: "main" },
   });
 
   return commit;
@@ -261,17 +236,6 @@ const loadCloudConfigFromDb = async (projectId) => {
   return {
     anonymousWriteEnabled: anonymousParsed === null ? false : anonymousParsed,
     historyEnabled: historyParsed === null ? true : historyParsed,
-  };
-};
-
-const parseCloudConfigCache = (raw) => {
-  if (!raw || typeof raw !== "object") return null;
-  const anonymousParsed = parseBooleanInput(raw.anonymousWriteEnabled);
-  const historyParsed = parseBooleanInput(raw.historyEnabled);
-  if (anonymousParsed === null || historyParsed === null) return null;
-  return {
-    anonymousWriteEnabled: anonymousParsed,
-    historyEnabled: historyParsed,
   };
 };
 
@@ -501,7 +465,7 @@ router.post("/", needLogin, requireScope("project:create"), projectWriteGuard("c
     };
 
     const result = await prisma.$transaction(async (tx) => {
-      const created = await tx.ow_projects.create({ data: outputJson });
+      const created = await tx.ow_projects.create({ data: { ...outputJson, default_branch: "main" } });
       await initializeEmptyProject(tx, {
         projectId: created.id,
         userId: res.locals.userid,
@@ -639,25 +603,7 @@ router.post("/savefile", needLogin, requireResource("project", "update", (req) =
     const sha256 = createHash("sha256").update(source).digest("hex");
     logger.debug(sha256);
 
-    await prisma.ow_projects_file
-      .create({
-        data: {
-          sha256,
-          source,
-          create_userid: res.locals.userid,
-        },
-      })
-      .catch((err) => {
-        if (err.code === "P2002") {
-          logger.debug("File already exists, skipping.");
-        } else {
-          logger.error(err);
-          return res.status(500).send({
-            status: "error",
-            message: "保存源代码时出错",
-          });
-        }
-      });
+    await saveProjectFile(source, { sha256, userId: res.locals.userid });
 
     const accessFileToken = await issueProjectFileAccessToken(
       sha256,
@@ -1015,8 +961,6 @@ router.get("/commits", async (req, res, next) => {
       });
     }
 
-    // 2. 使用 Set 存储所有需要获取的提交
-    const commits = new Set();
     const latestCommits = branches
       .filter((b) => b.latest_commit_hash)
       .map((b) => b.latest_commit_hash);
@@ -1064,30 +1008,14 @@ router.get("/commits", async (req, res, next) => {
       }
     }
 
-    // 4. 如果 depth 查询不完整或不存在，回退到 BFS 遍历
-    const queue = [...latestCommits];
-
-    while (queue.length > 0) {
-      const currentCommitId = queue.shift();
-      if (commits.has(currentCommitId)) continue;
-
-      const commit = await prisma.ow_projects_commits.findUnique({
-        where: { id: currentCommitId },
-      });
-
-      if (commit) {
-        commits.add(currentCommitId);
-        if (commit.parent_commit_id) {
-          queue.push(commit.parent_commit_id);
-        }
-      }
-    }
+    // Traverse the complete ancestry in one query, including retained fork history.
+    const commits = await listReachableCommitIds(latestCommits);
 
     // 5. 获取所有提交的详细信息
     const result = await prisma.ow_projects_commits.findMany({
       where: {
         id: {
-          in: Array.from(commits),
+          in: commits,
         },
       },
       select: {
@@ -1113,10 +1041,11 @@ router.get("/commits", async (req, res, next) => {
       },
     });
 
+    const authors = await sanitizeProfiles(result.map(commit => commit.author), res.locals.userid);
     res.status(200).send({
       status: "success",
       message: "获取成功 使用BFS",
-      data: await Promise.all(result.map(async (commit) => ({ ...commit, author: await sanitizeProfile(commit.author, res.locals.userid) }))),
+      data: result.map((commit, index) => ({ ...commit, author: authors[index] })),
     });
   } catch (err) {
     logger.error("Error getting project commits:", err);
@@ -1172,22 +1101,15 @@ router.get("/id/:id", (req, res, next) => req.headers["x-zerocat-delegation"] !=
 
   const project = await prisma.ow_projects.findFirst({
     where: { id: Number(req.params.id) },
-    select: projectSelectionFields(),
+    select: {
+      ...projectSelectionFields(),
+      project_tags: { select: { name: true, id: true, created_at: true } },
+    },
   });
 
-  const author = await prisma.ow_users.findFirst({
-    where: { id: Number(project.authorid) },
-    select: authorSelectionFields(),
-  });
-
-  const tags = await prisma.ow_projects_tags.findMany({
-    where: { projectid: Number(req.params.id) },
-    select: { name: true, id: true, created_at: true },
-  });
-
-  project.author = await sanitizeProfile(author, userId);
-  project.tags = tags;
-  logger.debug(tags);
+  project.tags = project.project_tags;
+  project.project_tags = project.tags.map(({ id, name }) => ({ id, name }));
+  logger.debug(project.tags);
   logger.debug(project);
   res.status(200).send((await sanitizeProjectAuthors([project], userId))[0]);
   } catch (error) { next(error); }
@@ -1199,16 +1121,6 @@ router.get("/id/:id/cloudconfig", async (req, res, next) => {
     const projectId = Number(req.params.id);
     const userId = res.locals.userid || 0;
     await ensureProjectVisible(projectId, userId);
-    const project = await prisma.ow_projects.findFirst({
-      where: { id: projectId },
-      select: { id: true },
-    });
-    if (!project) {
-      return res.status(404).send({
-        status: "error",
-        message: "项目不存在",
-      });
-    }
 
     const hasPermission = await hasProjectPermission(projectId, userId, "read");
     if (!hasPermission) {
@@ -1315,29 +1227,9 @@ router.put("/id/:id/cloudconfig", needLogin, requireResource("project", "update"
       });
     }
 
-    if (redisClient.client && redisClient.isConnected) {
-      try {
-        const cachedValue = await redisClient.client.hgetall(cloudConfigRedisKey(projectId));
-        let mergedConfig = parseCloudConfigCache(cachedValue);
-        if (!mergedConfig) {
-          mergedConfig = await loadCloudConfigFromDb(projectId);
-        } else {
-          for (const update of updates) {
-            if (update.key === PROJECT_CONFIG_KEY_CLOUD_ANON_WRITE) {
-              mergedConfig.anonymousWriteEnabled = parseBooleanConfigValue(update.raw_value, false);
-            }
-            if (update.key === PROJECT_CONFIG_KEY_CLOUD_HISTORY_ENABLED) {
-              mergedConfig.historyEnabled = parseBooleanConfigValue(update.raw_value, true);
-            }
-          }
-        }
-        await refreshCloudConfigCache(projectId, mergedConfig);
-      } catch (error) {
-        logger.warn(`[cloud-config] 刷新Redis缓存失败: ${cacheKey}`, error);
-      }
-    }
-
+    // Reuse the canonical read for both the response and the cache refresh.
     const fullConfig = await loadCloudConfigFromDb(projectId);
+    await refreshCloudConfigCache(projectId, fullConfig);
     const fullResponse = [
       {
         target_type: PROJECT_CONFIG_TARGET_TYPE,
@@ -1556,9 +1448,7 @@ router.get("/files/:sha256", async (req, res, next) => {
       });
     }
 
-    const file = await prisma.ow_projects_file.findFirst({
-      where: { sha256 },
-    });
+    const file = await readProjectFile(sha256);
 
     if (!file) {
       return res.status(200).send({
@@ -1771,7 +1661,8 @@ router.post("/branches/description", needLogin, requireResource("project", "upda
     const { projectid, branch } = req.query;
     const { description } = req.body;
 
-    if (!description) {
+    if (!description || typeof branch !== 'string' || !branch
+      || !Number.isSafeInteger(Number(projectid)) || Number(projectid) <= 0) {
       return res.status(400).send({
         status: "error",
         message: "缺少必要的参数",
@@ -1779,21 +1670,17 @@ router.post("/branches/description", needLogin, requireResource("project", "upda
     }
 
 
-    const branchRecord = await prisma.ow_projects_branch.findFirst({
+    const updated = await prisma.ow_projects_branch.updateMany({
       where: { projectid: Number(projectid), name: branch },
+      data: { description },
     });
 
-    if (!branchRecord) {
+    if (updated.count === 0) {
       return res.status(404).send({
         status: "error",
         message: "分支不存在",
       });
     }
-
-    await prisma.ow_projects_branch.update({
-      where: { id: branchRecord.id },
-      data: { description },
-    });
 
     res.status(200).send({
       status: "success",
@@ -1822,14 +1709,15 @@ router.post("/fork", needLogin, requireScope("project:create"), projectWriteGuar
       });
     }
     console.log(res.locals.userid);
-    const existingProject = await prisma.ow_projects.findMany({
+    const existingProject = await prisma.ow_projects.findFirst({
       where: {
         authorid: res.locals.userid,
         name: name,
       },
+      select: { id: true },
     });
     logger.debug(existingProject);
-    if (existingProject.length > 0) {
+    if (existingProject) {
       return res.status(200).send({
         status: "error",
         message: "同名项目已存在",
@@ -1871,20 +1759,16 @@ router.post("/fork", needLogin, requireScope("project:create"), projectWriteGuar
       },
     });
 
-    await Promise.all(
-      branches.map((branch) => {
-        return prisma.ow_projects_branch.create({
-          data: {
-            projectid: forkedProject.id,
-            name: branch.name,
-            creator: res.locals.userid,
-            latest_commit_hash: branch.latest_commit_hash,
-            description: branch.description,
-            protected: branch.protected,
-          },
-        });
-      })
-    );
+    await prisma.ow_projects_branch.createMany({
+      data: branches.map((branch) => ({
+        projectid: forkedProject.id,
+        name: branch.name,
+        creator: res.locals.userid,
+        latest_commit_hash: branch.latest_commit_hash,
+        description: branch.description,
+        protected: branch.protected,
+      })),
+    });
 
     res.status(200).send({
       status: "success",
@@ -1968,22 +1852,13 @@ router.get("/info/:id", async (req, res, next) => {
     const userId = res.locals.userid || 0; // 未登录用户为匿名用户
     await checkProjectPermission(req.params.id, userId, "read");
 
-    // 获取项目基本信息
+    // Fetch the author and tags with the project, including tag timestamps for this response.
     const project = await prisma.ow_projects.findFirst({
       where: { id: Number(req.params.id) },
-      select: projectSelectionFields(),
-    });
-
-    // 获取作者信息
-    const author = await prisma.ow_users.findFirst({
-      where: { id: Number(project.authorid) },
-      select: authorSelectionFields(),
-    });
-
-    // 获取标签信息
-    const tags = await prisma.ow_projects_tags.findMany({
-      where: { projectid: Number(req.params.id) },
-      select: { name: true, id: true, created_at: true },
+      select: {
+        ...projectSelectionFields(),
+        project_tags: { select: { name: true, id: true, created_at: true } },
+      },
     });
 
     // 获取分析数据
@@ -1997,8 +1872,8 @@ router.get("/info/:id", async (req, res, next) => {
     );
 
     // 组合所有数据
-    project.author = await sanitizeProfile(author, userId);
-    project.tags = tags;
+    project.tags = project.project_tags;
+    project.project_tags = project.tags.map(({ id, name }) => ({ id, name }));
     project.analytics = {
       pageviews: analytics.overview.pageviews.value,
       visitors: analytics.overview.visitors.value,

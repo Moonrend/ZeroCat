@@ -2,13 +2,12 @@ import logger from "./logger.js";
 import { prisma } from "./prisma.js";
 import zcconfig from "./config/zcconfig.js";
 import { createHash } from "crypto";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
-import { Readable } from "stream";
+import { putObject, getObject } from "./objectStorage.js";
 import sharp from "sharp";
 import ffmpeg from "fluent-ffmpeg";
 import { fileTypeFromBuffer } from "file-type";
 import { authorize } from "./auth/authorization.js";
-import { assertCanWrite, canViewContent, sanitizeProfile, visibleWhere } from "./moderation/visibility.js";
+import { assertCanWrite, canViewContent, sanitizeProfile, sanitizeProfiles, visibleWhere } from "./moderation/visibility.js";
 import { ModerationError } from "./moderation/policy.js";
 
 async function assertUploadAllowed(res, purpose = 'general') {
@@ -28,17 +27,6 @@ async function visibleExistingAsset(asset, viewerId) {
   }
   return asset;
 }
-
-// 配置S3客户端
-const s3Client = new S3Client({
-  endpoint: await zcconfig.get("s3.endpoint"),
-  region: await zcconfig.get("s3.region"),
-  forcePathStyle: await zcconfig.get("s3.forcePathStyle"),
-  credentials: {
-    accessKeyId: await zcconfig.get("s3.AWS_ACCESS_KEY_ID"),
-    secretAccessKey: await zcconfig.get("s3.AWS_SECRET_ACCESS_KEY"),
-  },
-});
 
 // 支持的文件类型
 const SUPPORTED_IMAGE_TYPES = [
@@ -167,101 +155,15 @@ export function getMimeType(filename) {
   return mimeTypes[ext] || 'application/octet-stream';
 }
 
-/**
- * 判断错误是否为可重试的瞬时错误（网络/TLS/连接相关）
- * @param {Error} error 错误对象
- * @returns {boolean}
- */
-function isRetryableError(error) {
-  const message = error.message || '';
-  // TLS/SSL 相关瞬时错误
-  if (message.includes('Client network socket disconnected before secure TLS connection was established')) return true;
-  if (message.includes('socket hang up')) return true;
-  // 网络相关错误码
-  const codes = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
-    'EPIPE', 'ERR_TLS_SOCKET_DISCONNECTED', 'ETLS'];
-  if (codes.includes(error.code)) return true;
-  // AWS SDK 特定：服务端限流/内部错误（5xx）
-  if (error.$metadata && error.$metadata.httpStatusCode >= 500) return true;
-  if (error.$metadata && error.$metadata.httpStatusCode === 429) return true;
-  return false;
-}
-
-/**
- * 带指数退避重试的异步操作包装器
- * @param {Function} fn 异步操作
- * @param {number} maxRetries 最大重试次数
- * @param {number} baseDelayMs 基础延迟（毫秒）
- * @returns {Promise<any>}
- */
-async function withRetry(fn, maxRetries = 3, baseDelayMs = 500) {
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      if (attempt < maxRetries && isRetryableError(error)) {
-        const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 200;
-        logger.warn(`S3操作失败 (尝试 ${attempt + 1}/${maxRetries + 1}): ${error.message}，${delay.toFixed(0)}ms 后重试...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      } else {
-        throw error;
-      }
-    }
-  }
-  throw lastError;
-}
-
-/**
- * 上传文件到S3（带自动重试）
- * @param {Buffer} buffer 文件缓冲区
- * @param {string} key S3键
- * @param {string} contentType 内容类型
- * @returns {Promise<string>} S3 URL
- */
+/** Upload public assets through the shared S3 transport. */
 export async function uploadToS3(buffer, key, contentType) {
-  const command = new PutObjectCommand({
-    Bucket: await zcconfig.get("s3.bucket"),
-    Key: key,
-    Body: buffer,
-    ContentType: contentType,
-    ACL: 'public-read',
-  });
-
-  await withRetry(() => s3Client.send(command));
+  await putObject({ bucket: await zcconfig.get("s3.bucket"), key, body: buffer,
+    contentType, acl: 'public-read' });
   return `${await zcconfig.get("s3.staticurl")}/${key}`;
 }
 
-async function streamToBuffer(stream) {
-  if (!stream) return Buffer.from('');
-  if (Buffer.isBuffer(stream)) return stream;
-  if (stream instanceof Uint8Array) return Buffer.from(stream);
-  if (typeof stream.arrayBuffer === 'function') {
-    const data = await stream.arrayBuffer();
-    return Buffer.from(data);
-  }
-
-  const chunks = [];
-  for await (const chunk of stream instanceof Readable ? stream : Readable.from(stream)) {
-    chunks.push(Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
 export async function downloadFromS3(key) {
-  const command = new GetObjectCommand({
-    Bucket: await zcconfig.get("s3.bucket"),
-    Key: key,
-  });
-
-  const response = await withRetry(() => s3Client.send(command));
-  const buffer = await streamToBuffer(response.Body);
-  return {
-    buffer,
-    contentType: response.ContentType || null,
-    contentLength: response.ContentLength || buffer.length,
-  };
+  return getObject({ bucket: await zcconfig.get("s3.bucket"), key });
 }
 
 /**
@@ -590,7 +492,8 @@ export async function getAssetsList(options = {}) {
     prisma.ow_assets.count({ where })
   ]);
 
-  for (const asset of assets) asset.uploader = await sanitizeProfile(asset.uploader, options.viewerId);
+  const uploaders = await sanitizeProfiles(assets.map(asset => asset.uploader), options.viewerId);
+  assets.forEach((asset, index) => { asset.uploader = uploaders[index]; });
   return {
     assets,
     pagination: {
@@ -653,17 +556,9 @@ export async function getAssetStats(viewerId = null) {
     }
   });
 
-  const totalAssets = await prisma.ow_assets.count({ where });
-  const totalSize = await prisma.ow_assets.aggregate({
-    where,
-    _sum: {
-      file_size: true
-    }
-  });
-
   return {
-    totalAssets,
-    totalSize: totalSize._sum.file_size || 0,
+    totalAssets: stats.reduce((total, stat) => total + stat._count.id, 0),
+    totalSize: stats.reduce((total, stat) => total + (stat._sum.file_size || 0), 0),
     byCategory: stats.map(stat => ({
       category: stat.category,
       count: stat._count.id,

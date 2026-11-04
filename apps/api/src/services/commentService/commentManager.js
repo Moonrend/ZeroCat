@@ -8,7 +8,8 @@ import { sanitizeComment } from './sanitizer.js';
 import { checkAkismetSpam } from './akismetService.js';
 import { batchGetUserLevels } from './levelService.js';
 import { renderMarkdown } from './markdown.js';
-import { visibleWhere, visibleSql, canViewContent, assertCanWrite, sanitizePublicUser } from '../moderation/visibility.js';
+import { visibleWhere, visibleSql, canViewContent, assertCanWrite } from '../moderation/visibility.js';
+import { getCommentProfileVisibility } from './profileVisibility.js';
 import { authorizeResourceOperation } from '../auth/resourceOperation.js';
 
 async function authorizeCommentOperation(spaceId, commentId, action, userId, options = {}) {
@@ -28,6 +29,38 @@ async function authorizeCommentOperation(spaceId, commentId, action, userId, opt
         }
     }
     return decision;
+}
+
+async function loadCommentUsers(spaceId, userIds, viewerId = null) {
+    const spaceUsersMap = new Map();
+    const zcUsersMap = new Map();
+    const profileVisibility = await getCommentProfileVisibility(userIds, viewerId);
+    if (userIds.length) {
+        const [spaceUsers, zcUsers] = await Promise.all([
+            prisma.ow_comment_service_users.findMany({
+                where: { space_id: spaceId, user_id: { in: userIds } },
+            }),
+            prisma.ow_users.findMany({
+                where: { id: { in: userIds } },
+                select: { id: true, username: true, display_name: true, avatar: true, url: true, label: true },
+            }),
+        ]);
+        for (const user of spaceUsers) spaceUsersMap.set(user.user_id, user);
+        for (const user of zcUsers) {
+            zcUsersMap.set(user.id, profileVisibility.hiddenUserIds.has(user.id) ? null : user);
+        }
+    }
+    return { spaceUsersMap, zcUsersMap, profileVisibility };
+}
+
+async function getModerationCounts(spaceId, commentVisibility) {
+    const groups = await prisma.ow_comment_service.groupBy({
+        by: ['status'],
+        where: { space_id: spaceId, status: { in: ['spam', 'waiting'] }, AND: [commentVisibility] },
+        _count: { _all: true },
+    });
+    const counts = new Map(groups.map(group => [group.status, group._count._all]));
+    return { spamCount: counts.get('spam') || 0, waitingCount: counts.get('waiting') || 0 };
 }
 
 async function buildVisibleCommentWhere(userId = null) {
@@ -231,27 +264,10 @@ export async function getComments(spaceId, query, options = {}) {
     )];
 
     // 批量加载空间用户
-    const spaceUsersMap = new Map();
-    const zcUsersMap = new Map();
-    if (userIds.length > 0) {
-        const [spaceUsers, zcUsers] = await Promise.all([
-            prisma.ow_comment_service_users.findMany({
-                where: { space_id: spaceId, user_id: { in: userIds } },
-            }),
-            prisma.ow_users.findMany({
-                where: { id: { in: userIds } },
-                select: { id: true, username: true, display_name: true, avatar: true, url: true, label: true },
-            }),
-        ]);
-        for (const su of spaceUsers) {
-            spaceUsersMap.set(su.user_id, su);
-        }
-        for (const u of zcUsers) {
-            zcUsersMap.set(u.id, await sanitizePublicUser(u, userId));
-        }
-    }
+    const { spaceUsersMap, zcUsersMap, profileVisibility } = await loadCommentUsers(spaceId, userIds, userId);
 
     const formatOptions = {
+        profileVisibility,
         viewerId: userId,
         isAdmin,
         disableUserAgent: config.disableUserAgent === 'true',
@@ -290,13 +306,14 @@ export async function getCommentCount(spaceId, urls = null, options = {}) {
 
     if (!Array.isArray(urls)) urls = [urls];
 
-    const counts = await Promise.all(
-        urls.map(url =>
-            prisma.ow_comment_service.count({
-                where: { space_id: spaceId, url, ...visibleWhere },
-            })
-        )
-    );
+    const groups = await prisma.ow_comment_service.groupBy({
+        by: ['url'],
+        where: { space_id: spaceId, url: { in: [...new Set(urls)] }, ...visibleWhere },
+        _count: { _all: true },
+    });
+    const countByUrl = new Map(groups.map(group => [group.url, group._count._all]));
+    // Waline expects the original order, including duplicate URLs and zero counts.
+    const counts = urls.map(url => countByUrl.get(url) || 0);
 
     return forceArray || counts.length > 1 ? counts : counts[0];
 }
@@ -318,25 +335,7 @@ export async function getRecentComments(spaceId, count = 10, config = {}, option
     const userIds = [...new Set(
         comments.filter(c => c.account_user_id).map(c => Number(c.account_user_id))
     )];
-    const spaceUsersMap = new Map();
-    const zcUsersMap = new Map();
-    if (userIds.length > 0) {
-        const [spaceUsers, zcUsers] = await Promise.all([
-            prisma.ow_comment_service_users.findMany({
-                where: { space_id: spaceId, user_id: { in: userIds } },
-            }),
-            prisma.ow_users.findMany({
-                where: { id: { in: userIds } },
-                select: { id: true, username: true, display_name: true, avatar: true, url: true, label: true },
-            }),
-        ]);
-        for (const su of spaceUsers) {
-            spaceUsersMap.set(su.user_id, su);
-        }
-        for (const u of zcUsers) {
-            zcUsersMap.set(u.id, await sanitizePublicUser(u, userId));
-        }
-    }
+    const { spaceUsersMap, zcUsersMap, profileVisibility } = await loadCommentUsers(spaceId, userIds, userId);
 
     // 用户等级
     let userLevelMap = null;
@@ -347,6 +346,7 @@ export async function getRecentComments(spaceId, count = 10, config = {}, option
     return Promise.all(
         comments.map(c =>
             formatComment(c, {
+                profileVisibility,
                 viewerId: userId,
                 isAdmin,
                 spaceUser: c.account_user_id ? spaceUsersMap.get(Number(c.account_user_id)) || null : null,
@@ -374,13 +374,14 @@ export async function getCommentList(spaceId, query, config = {}, options = {}) 
         return _searchComments(spaceId, keyword.trim(), { pageNum, size, status, owner, userId: query.userId });
     }
 
-    const where = { space_id: spaceId, AND: [await visibleWhere('comment_service', userId)] };
+    const commentVisibility = await visibleWhere('comment_service', userId);
+    const where = { space_id: spaceId, AND: [commentVisibility] };
     if (status) where.status = status;
     if (owner === 'mine' && query.userId) {
         where.account_user_id = Number(query.userId);
     }
 
-    const [comments, count, spamCount, waitingCount] = await Promise.all([
+    const [comments, count, statusCounts] = await Promise.all([
         prisma.ow_comment_service.findMany({
             where,
             orderBy: { insertedAt: 'desc' },
@@ -388,32 +389,14 @@ export async function getCommentList(spaceId, query, config = {}, options = {}) 
             take: size,
         }),
         prisma.ow_comment_service.count({ where }),
-        prisma.ow_comment_service.count({ where: { space_id: spaceId, status: 'spam', AND: [await visibleWhere('comment_service', userId)] } }),
-        prisma.ow_comment_service.count({ where: { space_id: spaceId, status: 'waiting', AND: [await visibleWhere('comment_service', userId)] } }),
+        getModerationCounts(spaceId, commentVisibility),
     ]);
+    const { spamCount, waitingCount } = statusCounts;
 
     const userIds = [...new Set(
         comments.filter(c => c.account_user_id).map(c => Number(c.account_user_id))
     )];
-    const spaceUsersMap = new Map();
-    const zcUsersMap = new Map();
-    if (userIds.length > 0) {
-        const [spaceUsers, zcUsers] = await Promise.all([
-            prisma.ow_comment_service_users.findMany({
-                where: { space_id: spaceId, user_id: { in: userIds } },
-            }),
-            prisma.ow_users.findMany({
-                where: { id: { in: userIds } },
-                select: { id: true, username: true, display_name: true, avatar: true, url: true, label: true },
-            }),
-        ]);
-        for (const su of spaceUsers) {
-            spaceUsersMap.set(su.user_id, su);
-        }
-        for (const u of zcUsers) {
-            zcUsersMap.set(u.id, await sanitizePublicUser(u, userId));
-        }
-    }
+    const { spaceUsersMap, zcUsersMap, profileVisibility } = await loadCommentUsers(spaceId, userIds);
 
     // 用户等级 (管理列表)
     let userLevelMap = null;
@@ -424,6 +407,7 @@ export async function getCommentList(spaceId, query, config = {}, options = {}) 
     const data = await Promise.all(
         comments.map(c =>
             formatComment(c, {
+                profileVisibility,
                 isAdmin: true,
                 spaceUser: c.account_user_id ? spaceUsersMap.get(Number(c.account_user_id)) || null : null,
                 zcUser: c.account_user_id ? zcUsersMap.get(Number(c.account_user_id)) || null : null,
@@ -479,12 +463,12 @@ async function _searchComments(spaceId, keyword, { pageNum, size, status, owner,
         ${whereSql} AND (c.comment ILIKE '%' || $1 || '%' OR ${scoreExpr} > 0.1)
     `;
 
-    const [rows, countRows, spamCount, waitingCount] = await Promise.all([
+    const [rows, countRows, statusCounts] = await Promise.all([
         prisma.$queryRawUnsafe(dataSql, ...params, size, (pageNum - 1) * size),
         prisma.$queryRawUnsafe(countSql, ...params),
-        prisma.ow_comment_service.count({ where: { space_id: spaceId, status: 'spam', AND: [await visibleWhere('comment_service', userId)] } }),
-        prisma.ow_comment_service.count({ where: { space_id: spaceId, status: 'waiting', AND: [await visibleWhere('comment_service', userId)] } }),
+        getModerationCounts(spaceId, await visibleWhere('comment_service', userId)),
     ]);
+    const { spamCount, waitingCount } = statusCounts;
 
     const count = countRows[0]?.total || 0;
     const ids = rows.map(r => r.id);
@@ -503,25 +487,12 @@ async function _searchComments(spaceId, keyword, { pageNum, size, status, owner,
     const sorted = ids.map(id => commentMap.get(id)).filter(Boolean);
 
     const userIds = [...new Set(sorted.filter(c => c.account_user_id).map(c => Number(c.account_user_id)))];
-    const spaceUsersMap = new Map();
-    const zcUsersMap = new Map();
-    if (userIds.length > 0) {
-        const [spaceUsers, zcUsers] = await Promise.all([
-            prisma.ow_comment_service_users.findMany({
-                where: { space_id: spaceId, user_id: { in: userIds } },
-            }),
-            prisma.ow_users.findMany({
-                where: { id: { in: userIds } },
-                select: { id: true, username: true, display_name: true, avatar: true, url: true, label: true },
-            }),
-        ]);
-        for (const su of spaceUsers) spaceUsersMap.set(su.user_id, su);
-        for (const u of zcUsers) zcUsersMap.set(u.id, await sanitizePublicUser(u, userId));
-    }
+    const { spaceUsersMap, zcUsersMap, profileVisibility } = await loadCommentUsers(spaceId, userIds);
 
     const data = await Promise.all(
         sorted.map(c =>
             formatComment(c, {
+                profileVisibility,
                 isAdmin: true,
                 spaceUser: c.account_user_id ? spaceUsersMap.get(Number(c.account_user_id)) || null : null,
                 zcUser: c.account_user_id ? zcUsersMap.get(Number(c.account_user_id)) || null : null,

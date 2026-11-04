@@ -10,7 +10,7 @@ mock.module(url("../prisma.js"), { namedExports: { prisma: db } });
 mock.module(url("../redis.js"), { defaultExport: { async get() { throw new Error("redis unavailable"); }, async set() {} } });
 mock.module(url("../config/zcconfig.js"), { defaultExport: { async get() { return []; } } });
 const { policyFromRows, policyAllowsScope, resourcePolicyAllowsScope, assertRoleInheritanceGraph,
-    getUserPolicy, getUserResourceRoleScopes, assertSupportedConditions } = await import("./policyEngine.js");
+    getUserPolicy, getUserResourcePolicies, getUserResourceRoleScopes, assertSupportedConditions } = await import("./policyEngine.js");
 const { scopeSatisfies, normalizeScopes, isValidScope } = await import("./scopes.js");
 const { createAuthorizer } = await import("./authorization.js");
 const row = (scope, effect = "allow", extra = {}) => ({ scope, effect, target_type: "global", target_id: "global", ...extra });
@@ -218,6 +218,34 @@ test("policy reads current DB even with Redis down, honors revocation and scopes
     assert.match(state.queries[0].sql, /expires_at.*CURRENT_TIMESTAMP/s);
     assert.ok(state.queries[0].values.includes("project"));
     assert.ok(state.queries[0].values.includes("7"));
+});
+
+test("resource policies batch candidates with global and scoped denies in one fresh read", async () => {
+    state.rows = [
+        row("project:12:read"), row("project:13:read"),
+        resource("project:read", "deny", { target_id: "13" }),
+        resource("project:manage", "allow", { target_id: "14", role_key: "editor" }),
+        resource("project:read", "allow", { target_id: "15", expires_at: new Date(0) }),
+        resource("project:read", "allow", { target_id: "16", conditions: { unsupported: true } }),
+    ];
+    const policies = await getUserResourcePolicies(3, "project");
+    assert.equal(state.queries.length, 1);
+    assert.equal(resourcePolicyAllowsScope(policies.get(12), "project:12:read"), true);
+    assert.equal(resourcePolicyAllowsScope(policies.get(13), "project:13:read"), false);
+    assert.equal(resourcePolicyAllowsScope(policies.get(14), "project:14:read"), true);
+    assert.equal(resourcePolicyAllowsScope(policies.get(15), "project:15:read"), false);
+    assert.equal(policies.has(16), false);
+    state.rows = [];
+    assert.equal((await getUserResourcePolicies(3, "project")).size, 0);
+    assert.equal(state.queries.length, 2);
+});
+
+test("resource policy batch rejects invalid global policy and respects caller transaction", async () => {
+    let calls = 0;
+    const transaction = { async $queryRaw() { calls++; return [row("project:read", "allow", { conditions: true })]; } };
+    assert.equal((await getUserResourcePolicies(3, "project", { db: transaction })).size, 0);
+    assert.equal(calls, 1);
+    assert.equal(state.queries.length, 0);
 });
 
 test("legacy collaborator scopes include effective deny rather than returning raw allows", async () => {

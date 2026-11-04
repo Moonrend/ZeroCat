@@ -2,7 +2,7 @@ import { prisma } from '../../prisma.js';
 import { buildContext, getAdminEmail } from './notifyContext.js';
 import { getEnabledProviders } from './providers/index.js';
 import logger from '../../logger.js';
-import { canViewContent, assertCanWrite } from '../../moderation/visibility.js';
+import { canViewContent, assertCanWrite, sanitizeProfiles } from '../../moderation/visibility.js';
 
 /**
  * 通知编排服务
@@ -43,8 +43,10 @@ const notifyService = {
             return { skipped: true, reason: 'parent_unavailable' };
         }
 
-        for (const record of [comment, parent].filter(Boolean)) {
-            if (record.account_user_id && !await canViewContent('profile', { id: record.account_user_id }, null)) {
+        const records = [comment, parent].filter(record => record?.account_user_id);
+        const profiles = await sanitizeProfiles(records.map(record => ({ id: record.account_user_id })));
+        for (const [index, record] of records.entries()) {
+            if (!profiles[index]) {
                 record.nick = '用户';
                 record.mail = null;
                 record.link = null;

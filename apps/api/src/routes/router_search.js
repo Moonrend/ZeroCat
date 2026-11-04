@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { prisma } from "../services/prisma.js"; // 功能函数集
 import logger from "../services/logger.js";
-import { visibleWhere, visibleSql, sanitizePublicUser } from "../services/moderation/visibility.js";
+import { visibleWhere, visibleSql, sanitizeProfiles } from "../services/moderation/visibility.js";
 
 async function appendVisibility(conditions, params, kind, alias, viewerId) {
   const visibility = await visibleSql(kind, alias, viewerId);
@@ -342,14 +342,15 @@ async function searchProjectFiles({
       create_userid,
       create_time,
       ts_rank_cd(
-        to_tsvector('simple', left(COALESCE(source, ''), $1)),
+        COALESCE(search_vector, to_tsvector('simple', left(COALESCE(source, ''), $1))),
         websearch_to_tsquery('simple', $2)
       ) AS score,
-      left(COALESCE(source, ''), 240) AS preview
+      COALESCE(search_preview, left(COALESCE(source, ''), 240)) AS preview
     FROM ow_projects_file
     WHERE create_userid = ANY($3::int[])
-      AND to_tsvector('simple', left(COALESCE(source, ''), $1))
-          @@ websearch_to_tsquery('simple', $2)
+      AND ((storage_provider = 's3' AND search_vector @@ websearch_to_tsquery('simple', $2))
+        OR (storage_provider IS DISTINCT FROM 's3'
+          AND to_tsvector('simple', left(COALESCE(source, ''), $1)) @@ websearch_to_tsquery('simple', $2)))
     ORDER BY score DESC, create_time DESC NULLS LAST
     LIMIT $4 OFFSET $5
     `,
@@ -365,8 +366,9 @@ async function searchProjectFiles({
     SELECT COUNT(*)::int AS total
     FROM ow_projects_file
     WHERE create_userid = ANY($2::int[])
-      AND to_tsvector('simple', left(COALESCE(source, ''), $1))
-          @@ websearch_to_tsquery('simple', $3)
+      AND ((storage_provider = 's3' AND search_vector @@ websearch_to_tsquery('simple', $3))
+        OR (storage_provider IS DISTINCT FROM 's3'
+          AND to_tsvector('simple', left(COALESCE(source, ''), $1)) @@ websearch_to_tsquery('simple', $3)))
     `,
     FILE_SEARCH_PREFIX_LENGTH,
     ownerFilter,
@@ -472,10 +474,10 @@ router.get("/", async (req, res, next) => {
     const { orderBy, order } = buildProjectOrder(orderbyQuery);
 
     const viewerId = res.locals.userid || null;
-    const projectVisibility = await visibleWhere("project", viewerId);
-    const userVisibility = await visibleWhere("profile", viewerId);
-    const postVisibility = await visibleWhere("post", viewerId);
-    const listVisibility = await visibleWhere("list", viewerId);
+    const projectVisibility = ["projects", "tags"].includes(normalizedScope) ? await visibleWhere("project", viewerId) : {};
+    const userVisibility = normalizedScope === "users" ? await visibleWhere("profile", viewerId) : {};
+    const postVisibility = normalizedScope === "posts" ? await visibleWhere("post", viewerId) : {};
+    const listVisibility = normalizedScope === "lists" ? await visibleWhere("list", viewerId) : {};
     const projectAnd = [
       projectVisibility,
       { OR: [{ state: "public" }, ...(viewerId ? [{ authorid: Number(viewerId) }] : [])] },
@@ -907,10 +909,10 @@ router.get("/", async (req, res, next) => {
       tagTotal = countedTags.length;
     }
 
-    users = (await Promise.all(users.map(user => sanitizePublicUser(user, viewerId)))).filter(Boolean);
-    await Promise.all([...projects, ...posts, ...lists].map(async item => {
-      item.author = await sanitizePublicUser(item.author, viewerId);
-    }));
+    const authoredItems = [...projects, ...posts, ...lists];
+    const profiles = await sanitizeProfiles([...users, ...authoredItems.map(item => item.author)], viewerId);
+    authoredItems.forEach((item, index) => { item.author = profiles[users.length + index]; });
+    users = profiles.slice(0, users.length).filter(Boolean);
     const totals = {
       projects: projectTotal,
       users: userTotal,

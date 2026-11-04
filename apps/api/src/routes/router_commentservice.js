@@ -109,16 +109,17 @@ router.get('/spaces/:cuid', (req, res, next) => {
         const isOwner = res.locals.userid && space.owner_id === res.locals.userid;
 
         // 获取所有者和管理团队信息 (所有人都能看到)
+        const profileVisibility = await visibleWhere('profile', res.locals.userid);
         const [owner, staff] = await Promise.all([
             prisma.ow_users.findFirst({
-                where: { id: space.owner_id, AND: [await visibleWhere('profile', res.locals.userid)] },
+                where: { id: space.owner_id, AND: [profileVisibility] },
                 select: { id: true, username: true, display_name: true, avatar: true },
             }),
             prisma.ow_comment_service_users.findMany({
                 where: {
                     space_id: space.id,
                     type: { in: ['administrator', 'moderator'] },
-                    user: await visibleWhere('profile', res.locals.userid),
+                    user: profileVisibility,
                 },
                 include: {
                     user: {

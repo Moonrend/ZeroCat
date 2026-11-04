@@ -221,6 +221,9 @@ const getCloudProject = async (projectId, userId) => {
             state: true,
             type: true,
             title: true,
+            is_shadowbanned: true,
+            shadowban_expires_at: true,
+            deleted_at: true,
         },
     });
 
@@ -621,6 +624,7 @@ router.get("/projectinfo2", async function (req, res, next) {
         }
         var author = await sanitizeProfile(await prisma.ow_users.findFirst({
             where: { id: result.authorid },
+            select: { id: true, display_name: true, bio: true, username: true, createdAt: true, avatar: true },
         }), res.locals.userid) || {};
         res.locals.is_author = result.authorid == res.locals.userid;
         logger.debug(result);
@@ -1054,7 +1058,7 @@ const handleCloudUpdatesRequest = async (req, res, next) => {
         const actorIds = [...new Set(updates.map((row) => row.actor_id).filter((id) => typeof id === "number"))];
         const users = actorIds.length > 0
             ? await prisma.ow_users.findMany({
-                where: {id: {in: actorIds}},
+                where: {id: {in: actorIds}, AND: [await visibleWhere('profile', res.locals.userid)]},
                 select: {
                     id: true,
                     username: true,
@@ -1063,7 +1067,7 @@ const handleCloudUpdatesRequest = async (req, res, next) => {
                 },
             })
             : [];
-        const userMap = new Map(await Promise.all(users.map(async (user) => [user.id, await sanitizeProfile(user, res.locals.userid)])));
+        const userMap = new Map(users.map(user => [user.id, user]));
 
         const mappedUpdates = updates.map((row) => {
             const data = typeof row.event_data === 'object' && row.event_data !== null ? { ...row.event_data } : {};
@@ -1140,7 +1144,7 @@ router.get("/cloud/:projectid/history", needLogin, requireResource("project", "r
         const actorIds = [...new Set(rows.map((row) => row.actor_id).filter((id) => typeof id === "number"))];
         const users = actorIds.length > 0
             ? await prisma.ow_users.findMany({
-                where: {id: {in: actorIds}},
+                where: {id: {in: actorIds}, AND: [await visibleWhere('profile', res.locals.userid)]},
                 select: {
                     id: true,
                     username: true,
@@ -1149,7 +1153,7 @@ router.get("/cloud/:projectid/history", needLogin, requireResource("project", "r
                 },
             })
             : [];
-        const userMap = new Map(await Promise.all(users.map(async (user) => [user.id, await sanitizeProfile(user, res.locals.userid)])));
+        const userMap = new Map(users.map(user => [user.id, user]));
 
         const history = rows.map((row) => ({
             id: row.id,

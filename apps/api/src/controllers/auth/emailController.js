@@ -178,7 +178,7 @@ export const verifyEmail = async (req, res) => {
         }
 
         // 验证验证码
-        const isValid = await verifyContact(email, token);
+        const isValid = await verifyContact(email, token, contact);
 
         if (!isValid) {
             return res.status(200).json({
@@ -186,16 +186,6 @@ export const verifyEmail = async (req, res) => {
                 message: "验证码无效",
             });
         }
-
-        // 更新邮箱为已验证状态
-        await prisma.ow_users_contacts.update({
-            where: {
-                contact_id: contact.contact_id,
-            },
-            data: {
-                verified: true,
-            },
-        });
 
         return res.status(200).json({
             status: "success",

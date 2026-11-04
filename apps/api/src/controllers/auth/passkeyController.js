@@ -164,15 +164,16 @@ export async function finishLogin(req, res) {
   let contact = null;
   let matched = null;
   try {
-    // Try fast path via JSON scalar array index
-    const maybe = await prisma.ow_users_contacts.findMany({
-      where: { contact_type: 'passkey', verified: true },
-      select: { contact_id: true, user_id: true, metadata: true }
-    });
-    for (const r of maybe) {
-      const creds = r.metadata?.credentials || [];
-      const m = creds.find(c => c.credentialID === credId);
-      if (m) { contact = r; matched = m; break; }
+    if (typeof credId === 'string' && credId) {
+      contact = await prisma.ow_users_contacts.findFirst({
+        where: {
+          contact_type: 'passkey',
+          verified: true,
+          metadata: { path: ['credentials'], array_contains: [{ credentialID: credId }] },
+        },
+        select: { contact_id: true, user_id: true, metadata: true },
+      });
+      matched = contact?.metadata?.credentials?.find(c => c.credentialID === credId) || null;
     }
   } catch (e) {
     logger.error('[passkey] 查找凭据失败', e);

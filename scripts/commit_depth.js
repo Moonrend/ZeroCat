@@ -1,61 +1,83 @@
-import { prisma } from '../apps/api/src/services/prisma.js';
+import { pathToFileURL } from 'node:url';
 
-async function calculateDepth(commitId, cache = new Map()) {
-    // 如果已经计算过这个提交的深度，直接返回缓存的结果
-    if (cache.has(commitId)) {
-        return cache.get(commitId);
+export function calculateDepths(commits) {
+    const byId = new Map(commits.map(commit => [commit.id, commit]));
+    const depths = new Map();
+
+    for (const commit of commits) {
+        const path = [];
+        const visiting = new Set();
+        let currentId = commit.id;
+        while (!depths.has(currentId)) {
+            const current = byId.get(currentId);
+            // Keep the original depth convention for roots and missing parents.
+            if (!current || !current.parent_commit_id) {
+                depths.set(currentId, 0);
+                break;
+            }
+            if (visiting.has(currentId)) {
+                throw new Error(`提交父链包含循环: ${currentId}`);
+            }
+            visiting.add(currentId);
+            path.push(currentId);
+            currentId = current.parent_commit_id;
+        }
+
+        let depth = depths.get(currentId);
+        for (let index = path.length - 1; index >= 0; index--) {
+            depths.set(path[index], ++depth);
+        }
     }
 
-    const commit = await prisma.ow_projects_commits.findUnique({
-        where: { id: commitId },
-        select: { parent_commit_id: true }
+    return depths;
+}
+
+export async function updateCommitDepths(prisma) {
+    const commits = await prisma.ow_projects_commits.findMany({
+        select: { id: true, parent_commit_id: true, depth: true },
     });
-
-    // 如果是根提交（没有父提交），深度为0
-    if (!commit || !commit.parent_commit_id) {
-        cache.set(commitId, 0);
-        return 0;
+    const depths = calculateDepths(commits);
+    const idsByDepth = new Map();
+    for (const commit of commits) {
+        const depth = depths.get(commit.id);
+        if (commit.depth === depth) continue;
+        if (!idsByDepth.has(depth)) idsByDepth.set(depth, []);
+        idsByDepth.get(depth).push(commit.id);
     }
 
-    // 递归计算父提交的深度，当前提交的深度为父提交深度+1
-    const parentDepth = await calculateDepth(commit.parent_commit_id, cache);
-    const depth = parentDepth + 1;
-    cache.set(commitId, depth);
-    return depth;
+    let updated = 0;
+    for (const [depth, ids] of idsByDepth) {
+        // Bound parameters even when many independent projects share a depth.
+        for (let offset = 0; offset < ids.length; offset += 1000) {
+            const batch = ids.slice(offset, offset + 1000);
+            const result = await prisma.ow_projects_commits.updateMany({
+                where: { id: { in: batch } },
+                data: { depth },
+            });
+            if (result.count !== batch.length) {
+                throw new Error('更新过程中提交已被删除，请重新运行深度迁移');
+            }
+            updated += result.count;
+        }
+    }
+    return { total: commits.length, updated };
 }
 
 async function main() {
-    console.log('开始更新提交深度...');
-
-    // 获取所有提交
-    const commits = await prisma.ow_projects_commits.findMany({
-        select: { id: true }
-    });
-
-    console.log(`找到 ${commits.length} 个提交需要更新`);
-
-    // 用于缓存已计算的深度，避免重复计算
-    const depthCache = new Map();
-
-    // 批量计算每个提交的深度
-    for (const commit of commits) {
-        const depth = await calculateDepth(commit.id, depthCache);
-
-        // 更新提交的深度
-        await prisma.ow_projects_commits.update({
-            where: { id: commit.id },
-            data: { depth }
-        });
+    const { prisma } = await import('../apps/api/src/services/prisma.js');
+    try {
+        console.log('开始更新提交深度...');
+        const { total, updated } = await updateCommitDepths(prisma);
+        console.log(`找到 ${total} 个提交，更新 ${updated} 个提交深度`);
+        console.log('提交深度更新完成');
+    } finally {
+        await prisma.$disconnect();
     }
-
-    console.log('提交深度更新完成');
 }
 
-main()
-    .catch((e) => {
-        console.error('迁移出错:', e);
-        process.exit(1);
-    })
-    .finally(async () => {
-        await prisma.$disconnect();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+    main().catch(error => {
+        console.error('迁移出错:', error);
+        process.exitCode = 1;
     });
+}

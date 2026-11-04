@@ -839,23 +839,23 @@ router.delete('/admin/federation/blocklist/:domain', requireAdmin, async (req, r
 router.get('/admin/federation/stats', requireAdmin, async (req, res) => {
     try {
         // 基础统计
-        const [
-            totalRemoteFollowers,
-            totalProxyUsers,
-            totalFederatedPosts,
-            totalLocalPosts,
-            totalDeliveryRecords,
-        ] = await Promise.all([
-            prisma.ow_target_configs.count({ where: { target_type: 'ap_follow' } }),
-            prisma.ow_target_configs.count({ where: { target_type: 'ap_actor' } }),
-            prisma.ow_posts.count({ where: { is_deleted: false, platform_refs: { not: null } } }),
+        const [configGroups, totalLocalPosts] = await Promise.all([
+            prisma.ow_target_configs.groupBy({
+                by: ['target_type'],
+                where: { target_type: { in: ['ap_follow', 'ap_actor', 'ap_delivery'] } },
+                _count: { _all: true },
+            }),
             prisma.ow_posts.count({ where: { is_deleted: false, AND: [await visibleWhere('post')] } }),
-            prisma.ow_target_configs.count({ where: { target_type: 'ap_delivery' } }),
         ]);
+        const configCounts = new Map(configGroups.map(row => [row.target_type, row._count._all]));
+        const totalRemoteFollowers = configCounts.get('ap_follow') || 0;
+        const totalProxyUsers = configCounts.get('ap_actor') || 0;
+        const totalDeliveryRecords = configCounts.get('ap_delivery') || 0;
 
         // 外部平台同步统计
         const platformStats = await prisma.$queryRaw`
             SELECT
+                COUNT(*) AS federated_posts,
                 COUNT(*) FILTER (WHERE platform_refs::jsonb ? 'twitter') AS twitter_synced,
                 COUNT(*) FILTER (WHERE platform_refs::jsonb ? 'bluesky') AS bluesky_synced,
                 COUNT(*) FILTER (WHERE platform_refs::jsonb ? 'activitypub') AS activitypub_synced
@@ -890,7 +890,7 @@ router.get('/admin/federation/stats', requireAdmin, async (req, res) => {
                 counts: {
                     remoteFollowers: totalRemoteFollowers,
                     proxyUsers: totalProxyUsers,
-                    federatedPosts: totalFederatedPosts,
+                    federatedPosts: Number(platformStats?.[0]?.federated_posts || 0),
                     localPosts: totalLocalPosts,
                     deliveryRecords: totalDeliveryRecords,
                 },

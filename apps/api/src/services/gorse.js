@@ -12,11 +12,24 @@ import zcconfig from './config/zcconfig.js';
 import logger from './logger.js';
 import { prisma } from './prisma.js';
 import { visibleWhere, canViewContent } from './moderation/visibility.js';
+import { activeRestrictionWhere } from './moderation/restrictions.js';
+
+const PUBLIC_MODELS = { post: 'ow_posts', project: 'ow_projects', profile: 'ow_users' };
 
 async function filterPublicRecords(kind, records) {
-    const checked = await Promise.all((records || []).map(async record =>
-        record && await canViewContent(kind, record, null) ? record : null));
-    return checked.filter(Boolean);
+    const ids = [...new Set((records || []).filter(Boolean).map(record => Number(record.id))
+        .filter(id => Number.isSafeInteger(id) && id > 0))];
+    if (!ids.length) return [];
+    const visibility = await visibleWhere(kind);
+    const allowed = new Set();
+    for (let start = 0; start < ids.length; start += 500) {
+        const rows = await prisma[PUBLIC_MODELS[kind]].findMany({
+            where: { id: { in: ids.slice(start, start + 500) }, AND: [visibility] },
+            select: { id: true },
+        });
+        for (const row of rows) allowed.add(row.id);
+    }
+    return (records || []).filter(record => record && allowed.has(Number(record.id)));
 }
 import * as embeddingService from './embedding.js';
 
@@ -31,9 +44,29 @@ async function feedbackIsPublic(userId, itemId) {
 }
 
 async function filterPublicFeedbacks(rows, userId, itemId) {
-    const checked = await Promise.all(rows.map(async row =>
-        await feedbackIsPublic(userId(row), itemId(row)) ? row : null));
-    return checked.filter(Boolean);
+    if (!rows.length) return [];
+    const entries = rows.map(row => {
+        const match = String(itemId(row)).match(/^(post|project|user)_(\d+)$/);
+        return match ? { row, actorId: Number(userId(row)),
+            kind: match[1] === 'user' ? 'profile' : match[1], id: Number(match[2]) } : null;
+    }).filter(Boolean);
+    if (!entries.length) return [];
+    const actorIds = [...new Set(entries.map(entry => entry.actorId))];
+    const hidden = new Set();
+    for (let start = 0; start < actorIds.length; start += 500) {
+        const rules = await prisma.ow_user_restrictions.findMany({
+            where: { user_id: { in: actorIds.slice(start, start + 500) }, ...activeRestrictionWhere('shadowban', 'activity') },
+            select: { user_id: true },
+        });
+        for (const rule of rules) hidden.add(rule.user_id);
+    }
+    const allowed = new Map();
+    for (const kind of Object.keys(PUBLIC_MODELS)) {
+        const records = entries.filter(entry => entry.kind === kind && !hidden.has(entry.actorId))
+            .map(entry => ({ id: entry.id }));
+        allowed.set(kind, new Set((await filterPublicRecords(kind, records)).map(record => record.id)));
+    }
+    return entries.filter(entry => !hidden.has(entry.actorId) && allowed.get(entry.kind).has(entry.id)).map(entry => entry.row);
 }
 
 // Gorse 反馈类型常量
@@ -626,7 +659,7 @@ export async function insertFeedback(feedbackType, userId, itemId, { timestamp, 
  */
 export async function insertFeedbacks(feedbacks) {
     try {
-        feedbacks = (await Promise.all(feedbacks.map(async feedback => await feedbackIsPublic(feedback.userId, feedback.itemId) ? feedback : null))).filter(Boolean);
+        feedbacks = await filterPublicFeedbacks(feedbacks, feedback => feedback.userId, feedback => feedback.itemId);
         if (!feedbacks.length) return;
         const client = await getClient();
         if (!client) return;

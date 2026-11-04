@@ -1,6 +1,6 @@
 import { prisma } from '../services/prisma.js'
 import logger from "../services/logger.js";
-import { visibleWhere, canViewContent, assertCanWrite, sanitizePublicUser } from "../services/moderation/visibility.js";
+import { visibleWhere, canViewContent, assertCanWrite, sanitizeProfiles } from "../services/moderation/visibility.js";
 import { authorizeResourceOperation } from "../services/auth/resourceOperation.js";
 
 async function ensureListOwner(userId, listId, action, authorizationContext) {
@@ -37,17 +37,10 @@ export async function getProjectList(listId, userId, authorizationContext) {
             && list.authorid !== (decision?.principalId ?? Number(userId))) return null;
         if (!await canViewContent("list", list, userId, { ignorePrivacy: true })) return null;
 
-        // Get the projects in the list
-        const listItems = await prisma.ow_projects_list_items.findMany({
-            where: {listid: parseInt(listId)}
-        });
-
-        const projectIds = listItems.map(item => item.projectid);
-
-        // Get the project details
+        // Filter through list membership without loading the intermediate item rows.
         const projects = await prisma.ow_projects.findMany({
             where: {
-                id: {in: projectIds},
+                lists: { some: { listid: parseInt(listId) } },
                 AND: [await visibleWhere("project", userId)],
                 OR: [{ state: "public" }, ...(userId ? [{ authorid: Number(userId) }] : [])],
             },
@@ -75,9 +68,8 @@ export async function getProjectList(listId, userId, authorizationContext) {
             }
         });
 
-        await Promise.all(projects.map(async project => {
-            project.author = await sanitizePublicUser(project.author, userId);
-        }));
+        const authors = await sanitizeProfiles(projects.map(project => project.author), userId);
+        projects.forEach((project, index) => { project.author = authors[index]; });
         return {
             ...list,
             projects
@@ -100,27 +92,14 @@ export async function getUserListInfoAndCheak(userId, projectId) {
             return [];
         }
 
-        // 使用原始 SQL 查询获取用户的列表
-        const lists = await prisma.$queryRaw`
-      SELECT * FROM ow_projects_lists
-      WHERE authorid = ${parseInt(userId)}
-    `;
-
-        // 使用原始 SQL 查询获取项目的列表项
-        const listItems = await prisma.$queryRaw`
-      SELECT * FROM ow_projects_list_items
-      WHERE projectid = ${parseInt(projectId)}
-    `;
-
-        const projectListIds = listItems.map(item => item.listid);
-
-        // 标记包含项目的列表
-        const listsWithStatus = lists.map(list => ({
-            ...list,
-            hasProject: projectListIds.includes(list.id)
-        }));
-
-        return listsWithStatus;
+        return await prisma.$queryRaw`
+            SELECT l.*, EXISTS (
+                SELECT 1 FROM ow_projects_list_items i
+                WHERE i.listid = l.id AND i.projectid = ${parseInt(projectId)}
+            ) AS "hasProject"
+            FROM ow_projects_lists l
+            WHERE l.authorid = ${parseInt(userId)}
+        `;
     } catch (error) {
         logger.error("Error in getUserListInfoAndCheak:", error);
         throw error;
@@ -347,10 +326,8 @@ export async function getUserListInfoPublic(userId, currentUserId) {
             }
         });
 
-        return Promise.all(lists.map(async list => ({
-            ...list,
-            author: await sanitizePublicUser(list.author, currentUserId),
-        })));
+        const authors = await sanitizeProfiles(lists.map(list => list.author), currentUserId);
+        return lists.map((list, index) => ({ ...list, author: authors[index] }));
     } catch (error) {
         logger.error("Error in getUserListInfoPublic:", error);
         throw error;

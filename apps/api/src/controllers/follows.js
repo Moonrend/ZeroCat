@@ -77,15 +77,6 @@ export async function followUser(followerId, followedId, note = "") {
             throw new Error("用户不存在");
         }
 
-        const followerUser = await prisma.ow_users.findUnique({
-            where: {id: followerId},
-            select: {
-                username: true,
-                display_name: true,
-            },
-        });
-        const followerName = formatFollowerName(followerUser);
-
         // Check if already following
         const existingFollow = await prisma.ow_user_relationships.findUnique({
             where: {
@@ -104,6 +95,12 @@ export async function followUser(followerId, followedId, note = "") {
             }
             return existingFollow;
         }
+
+        const followerUser = await prisma.ow_users.findUnique({
+            where: { id: followerId },
+            select: { username: true, display_name: true },
+        });
+        const followerName = formatFollowerName(followerUser);
 
         // Create relationship record with note
         const relationship = await prisma.ow_user_relationships.create({
@@ -214,27 +211,14 @@ export async function unfollowUser(followerId, followedId) {
         });
 
         // 取消关注时，如果该用户通知等级是 ENHANCED，则删除配置回到默认 BASIC。
-        const userSetting = await prisma.ow_notification_settings.findUnique({
+        await prisma.ow_notification_settings.deleteMany({
             where: {
-                user_id_target_type_target_id: {
-                    user_id: followerId,
-                    target_type: "USER",
-                    target_id: String(followedId)
-                }
+                user_id: followerId,
+                target_type: "USER",
+                target_id: String(followedId),
+                level: "ENHANCED",
             },
-            select: {
-                id: true,
-                level: true
-            }
         });
-
-        if (userSetting?.level === "ENHANCED") {
-            await prisma.ow_notification_settings.delete({
-                where: {
-                    id: userSetting.id
-                }
-            });
-        }
 
         // Gorse 反馈：取消关注
         if (result.count > 0) {
@@ -358,13 +342,14 @@ export async function unblockUser(blockerId, blockedId) {
  */
 export async function getUserFollowers(userId, limit = 20, offset = 0, viewerId = null) {
     try {
-        // Find all users who follow the target user
+        const profileVisibility = await visibleWhere("profile", viewerId);
+        const where = {
+            target_user_id: userId,
+            relationship_type: "follow",
+            AND: [await visibleWhere("relation", viewerId), { source_user: profileVisibility }, { target_user: profileVisibility }],
+        };
         const relationships = await prisma.ow_user_relationships.findMany({
-            where: {
-                target_user_id: userId,
-                relationship_type: "follow",
-                AND: [await visibleWhere("relation", viewerId), { source_user: await visibleWhere("profile", viewerId) }, { target_user: await visibleWhere("profile", viewerId) }],
-            },
+            where,
             include: {
                 // Join with ow_users to get follower details
                 // Note: This doesn't work directly with Prisma, we need to adjust the query
@@ -410,13 +395,7 @@ export async function getUserFollowers(userId, limit = 20, offset = 0, viewerId 
         }));
 
         // Get total count
-        const totalCount = await prisma.ow_user_relationships.count({
-            where: {
-                target_user_id: userId,
-                relationship_type: "follow",
-                AND: [await visibleWhere("relation", viewerId), { source_user: await visibleWhere("profile", viewerId) }, { target_user: await visibleWhere("profile", viewerId) }],
-            },
-        });
+        const totalCount = await prisma.ow_user_relationships.count({ where });
 
         // 检查是否为远程代理用户，附加远端粉丝数量
         let remoteFollowersCount = null;
@@ -454,13 +433,14 @@ export async function getUserFollowers(userId, limit = 20, offset = 0, viewerId 
  */
 export async function getUserFollowing(userId, limit = 20, offset = 0, viewerId = null) {
     try {
-        // Find all users who the source user follows
+        const profileVisibility = await visibleWhere("profile", viewerId);
+        const where = {
+            source_user_id: userId,
+            relationship_type: "follow",
+            AND: [await visibleWhere("relation", viewerId), { source_user: profileVisibility }, { target_user: profileVisibility }],
+        };
         const relationships = await prisma.ow_user_relationships.findMany({
-            where: {
-                source_user_id: userId,
-                relationship_type: "follow",
-                AND: [await visibleWhere("relation", viewerId), { source_user: await visibleWhere("profile", viewerId) }, { target_user: await visibleWhere("profile", viewerId) }],
-            },
+            where,
             orderBy: {created_at: "desc"},
             take: limit,
             skip: offset,
@@ -502,13 +482,7 @@ export async function getUserFollowing(userId, limit = 20, offset = 0, viewerId 
         }));
 
         // Get total count
-        const totalCount = await prisma.ow_user_relationships.count({
-            where: {
-                source_user_id: userId,
-                relationship_type: "follow",
-                AND: [await visibleWhere("relation", viewerId), { source_user: await visibleWhere("profile", viewerId) }, { target_user: await visibleWhere("profile", viewerId) }],
-            },
-        });
+        const totalCount = await prisma.ow_user_relationships.count({ where });
 
         // 检查是否为远程代理用户，附加远端关注数量
         let remoteFollowingCount = null;
@@ -674,21 +648,16 @@ export async function isBlocking(blockerId, blockedId) {
  */
 export async function getRelationshipsBetweenUsers(userId1, userId2) {
     try {
-        // Get relationships where userId1 is the source
-        const outgoingRelationships = await prisma.ow_user_relationships.findMany({
+        const relationships = await prisma.ow_user_relationships.findMany({
             where: {
-                source_user_id: userId1,
-                target_user_id: userId2,
+                OR: [
+                    { source_user_id: userId1, target_user_id: userId2 },
+                    { source_user_id: userId2, target_user_id: userId1 },
+                ],
             },
         });
-
-        // Get relationships where userId1 is the target
-        const incomingRelationships = await prisma.ow_user_relationships.findMany({
-            where: {
-                source_user_id: userId2,
-                target_user_id: userId1,
-            },
-        });
+        const outgoingRelationships = relationships.filter((rel) => rel.source_user_id === userId1);
+        const incomingRelationships = relationships.filter((rel) => rel.source_user_id === userId2);
 
         // Format into easy-to-use object
         const relationshipMap = {
@@ -731,25 +700,13 @@ export async function getRelationshipsBetweenUsers(userId1, userId2) {
 export async function updateFollowNote(followerId, followedId, note) {
     await assertCanWrite(Number(followerId), "relations", "update");
     try {
-        // Check if relationship exists
-        const existingFollow = await prisma.ow_user_relationships.findUnique({
+        const updatedRelationship = await prisma.ow_user_relationships.update({
             where: {
                 source_user_id_target_user_id_relationship_type: {
                     source_user_id: followerId,
                     target_user_id: followedId,
                     relationship_type: "follow",
                 },
-            },
-        });
-
-        if (!existingFollow) {
-            throw new Error("关注关系不存在");
-        }
-
-        // Update the relationship note
-        const updatedRelationship = await prisma.ow_user_relationships.update({
-            where: {
-                id: existingFollow.id,
             },
             data: {
                 metadata: {
@@ -761,6 +718,7 @@ export async function updateFollowNote(followerId, followedId, note) {
 
         return updatedRelationship;
     } catch (error) {
+        if (error.code === "P2025") throw new Error("关注关系不存在");
         logger.error("Error in updateFollowNote:", error);
         throw error;
     }
@@ -777,25 +735,13 @@ export async function updateFollowNote(followerId, followedId, note) {
 export async function updateBlockReason(blockerId, blockedId, reason) {
     await assertCanWrite(Number(blockerId), "relations", "update");
     try {
-        // Check if relationship exists
-        const existingBlock = await prisma.ow_user_relationships.findUnique({
+        const updatedRelationship = await prisma.ow_user_relationships.update({
             where: {
                 source_user_id_target_user_id_relationship_type: {
                     source_user_id: blockerId,
                     target_user_id: blockedId,
                     relationship_type: "block",
                 },
-            },
-        });
-
-        if (!existingBlock) {
-            throw new Error("拉黑关系不存在");
-        }
-
-        // Update the relationship reason
-        const updatedRelationship = await prisma.ow_user_relationships.update({
-            where: {
-                id: existingBlock.id,
             },
             data: {
                 metadata: {
@@ -807,6 +753,7 @@ export async function updateBlockReason(blockerId, blockedId, reason) {
 
         return updatedRelationship;
     } catch (error) {
+        if (error.code === "P2025") throw new Error("拉黑关系不存在");
         logger.error("Error in updateBlockReason:", error);
         throw error;
     }
@@ -821,27 +768,16 @@ export async function updateBlockReason(blockerId, blockedId, reason) {
  */
 export async function getRelationshipNotes(userId, targetUserId) {
     try {
-        // Get follow note if exists
-        const followRelationship = await prisma.ow_user_relationships.findUnique({
+        const relationships = await prisma.ow_user_relationships.findMany({
             where: {
-                source_user_id_target_user_id_relationship_type: {
-                    source_user_id: userId,
-                    target_user_id: targetUserId,
-                    relationship_type: "follow",
-                },
+                source_user_id: userId,
+                target_user_id: targetUserId,
+                relationship_type: { in: ["follow", "block"] },
             },
+            select: { relationship_type: true, metadata: true, created_at: true, updated_at: true },
         });
-
-        // Get block reason if exists
-        const blockRelationship = await prisma.ow_user_relationships.findUnique({
-            where: {
-                source_user_id_target_user_id_relationship_type: {
-                    source_user_id: userId,
-                    target_user_id: targetUserId,
-                    relationship_type: "block",
-                },
-            },
-        });
+        const followRelationship = relationships.find((rel) => rel.relationship_type === "follow");
+        const blockRelationship = relationships.find((rel) => rel.relationship_type === "block");
 
         return {
             follow: followRelationship

@@ -475,14 +475,18 @@ export async function updateSpaceUser(spaceId, userId, data) {
  * 获取空间统计
  */
 export async function getSpaceStats(spaceId) {
-    const [commentCount, userCount, waitingCount, spamCount] = await Promise.all([
-        prisma.ow_comment_service.count({ where: { space_id: spaceId } }),
+    const [statusCounts, userCount] = await Promise.all([
+        prisma.ow_comment_service.groupBy({
+            by: ['status'],
+            where: { space_id: spaceId },
+            _count: { _all: true },
+        }),
         prisma.ow_comment_service_users.count({ where: { space_id: spaceId } }),
-        prisma.ow_comment_service.count({ where: { space_id: spaceId, status: 'waiting' } }),
-        prisma.ow_comment_service.count({ where: { space_id: spaceId, status: 'spam' } }),
     ]);
+    const counts = new Map(statusCounts.map(group => [group.status, group._count._all]));
+    const commentCount = statusCounts.reduce((total, group) => total + group._count._all, 0);
 
-    return { commentCount, userCount, waitingCount, spamCount };
+    return { commentCount, userCount, waitingCount: counts.get('waiting') || 0, spamCount: counts.get('spam') || 0 };
 }
 
 // ============================================================

@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { prisma } from '../prisma.js';
+import { loadArticleData } from './articleData.js';
 import { createInstallationToken } from './githubApp.js';
 import { assertSyncAuthorized, loadSyncProject, moderationRemovalProject, syncAuthorizationContext } from './authorization.js';
 import { canViewContent, visibleWhere } from '../moderation/visibility.js';
@@ -309,7 +310,7 @@ async function syncAllArticles({ userId, reason, triggerProjectId, actorId, auth
         }
     }
 
-    const fileEntries = [];
+    const eligibleProjects = [];
     for (const project of projects) {
         // Moderation removals use a separate job that cannot publish the other articles.
         if (!await canViewContent('project', project, null, { ignorePrivacy: true })) continue;
@@ -325,21 +326,15 @@ async function syncAllArticles({ userId, reason, triggerProjectId, actorId, auth
             continue;
         }
 
-        const commit = await prisma.ow_projects_commits.findFirst({
-            where: { project_id: project.id },
-            orderBy: { commit_date: 'desc' },
-        });
-        if (!commit) continue;
+        eligibleProjects.push(project);
+    }
 
-        const fileRecord = await prisma.ow_projects_file.findFirst({
-            where: { sha256: commit.commit_file },
-            select: { source: true },
-        });
-
-        const tags = await prisma.ow_projects_tags.findMany({
-            where: { projectid: project.id },
-            select: { name: true },
-        });
+    const articleData = await loadArticleData(eligibleProjects.map(project => project.id));
+    const fileEntries = [];
+    for (const project of eligibleProjects) {
+        const article = articleData.get(project.id);
+        if (!article) continue;
+        const { commit, source, tags } = article;
 
         const fileName = buildFileName(settings.fileNameTemplate, { project, slug: project.name });
         let filePath = buildFilePath(directory, fileName);
@@ -350,7 +345,7 @@ async function syncAllArticles({ userId, reason, triggerProjectId, actorId, auth
         const markdown = buildArticleMarkdown({
             project,
             commit,
-            source: fileRecord?.source || '',
+            source,
             tags,
             framework: settings.framework,
             frontMatterOptions: settings.frontMatter,

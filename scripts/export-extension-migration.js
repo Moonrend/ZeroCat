@@ -1,13 +1,9 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import "dotenv/config";
-import { PrismaPg } from '@prisma/adapter-pg'
-import { PrismaClient } from '../apps/api/generated/prisma/client.ts'
-
-const connectionString = `postgresql://zerocat:zerocat_pass_change_me@127.0.0.1:5432/zerocat`
-
-const adapter = new PrismaPg({ connectionString })
-const prisma = new PrismaClient({ adapter })
+import { pathToFileURL } from 'node:url';
+import { getExtensionURLs, hasMigratableExtensions, fetchExtensionReferences } from './extension-migration-data.js';
+import { prisma } from '../apps/api/src/services/prisma.js';
+import { hydrateProjectFiles, PROJECT_FILE_SELECT } from '../apps/api/src/services/projectFileStorage.js';
 
 const OUTPUT_ROOT = path.resolve('migration-output/extensions');
 const INLINE_DIR = path.join(OUTPUT_ROOT, 'inline-scripts');
@@ -51,45 +47,12 @@ function parseDataUrl(dataUrl) {
   }
 }
 
-async function fetchCommitsAndProjects(sha) {
-  const commits = await prisma.ow_projects_commits.findMany({
-    where: { commit_file: sha },
-    select: {
-      id: true,
-      project_id: true,
-    },
-  });
-
-  const projectIds = [...new Set(commits.map((c) => c.project_id).filter(Boolean))];
-  const projects = projectIds.length
-    ? await prisma.ow_projects.findMany({
-        where: { id: { in: projectIds } },
-        select: { id: true, name: true, title: true },
-      })
-    : [];
-
-  return { commits, projects };
-}
-
-async function processFile(record) {
-  const { sha256, source } = record;
-  if (!source) return [];
-
-  let parsed;
-  try {
-    parsed = JSON.parse(source);
-  } catch (err) {
-    console.warn(`Skip ${sha256}: invalid JSON`);
-    return [];
-  }
-
-  const extensionURLs = parsed?.extensionURLs;
-  if (!extensionURLs || typeof extensionURLs !== 'object') {
-    return [];
-  }
+async function processFile(record, references) {
+  const { sha256, extensionURLs } = record;
+  if (!references) return [];
 
   const rows = [];
-  const { commits, projects } = await fetchCommitsAndProjects(sha256);
+  const { commits, projects } = references;
 
   for (const [key, value] of Object.entries(extensionURLs)) {
     const url = typeof value === 'string' ? value.trim() : '';
@@ -137,6 +100,16 @@ async function processFile(record) {
   return rows;
 }
 
+export async function loadExportBatch(db, after = null) {
+  const rows = await db.ow_projects_file.findMany({
+    where: after ? { sha256: { gt: after } } : {},
+    take: BATCH_SIZE,
+    orderBy: { sha256: 'asc' },
+    select: PROJECT_FILE_SELECT,
+  });
+  return rows.length ? hydrateProjectFiles(rows) : [];
+}
+
 async function main() {
   await ensureDir(OUTPUT_ROOT);
   await ensureDir(INLINE_DIR);
@@ -159,18 +132,20 @@ async function main() {
   let matched = 0;
 
   while (true) {
-    const batch = await prisma.ow_projects_file.findMany({
-      take: BATCH_SIZE,
-      skip: cursor ? 1 : 0,
-      ...(cursor ? { cursor: { sha256: cursor } } : {}),
-      orderBy: { sha256: 'asc' },
-      select: { sha256: true, source: true },
-    });
+    const batch = await loadExportBatch(prisma, cursor);
 
     if (!batch.length) break;
 
-    for (const record of batch) {
-      const rows = await processFile(record);
+    const prepared = batch.map(record => ({
+      sha256: record.sha256,
+      extensionURLs: getExtensionURLs(record),
+    }));
+    const references = await fetchExtensionReferences(prisma, prepared
+      .filter(record => hasMigratableExtensions(record.extensionURLs))
+      .map(record => record.sha256));
+
+    for (const record of prepared) {
+      const rows = await processFile(record, references.get(record.sha256));
       if (rows.length) {
         matched += rows.length;
         csvRows.push(...rows);
@@ -192,11 +167,13 @@ async function main() {
   console.log(`Inline scripts saved under ${INLINE_DIR}`);
 }
 
-main()
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main()
+    .catch((err) => {
+      console.error(err);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}

@@ -2,7 +2,7 @@ import {prisma} from "../services/prisma.js";
 import logger from "../services/logger.js";
 import {createNotification} from "./notifications.js";
 import {EventConfig} from "../config/eventConfig.js";
-import { visibleSql, canViewContent, sanitizePublicUser } from "../services/moderation/visibility.js";
+import { visibleSql, visibleWhere, sanitizeProfiles } from "../services/moderation/visibility.js";
 
 // 重新导出这些常量供外部使用
 export {EventConfig};
@@ -611,36 +611,69 @@ export async function getActorEvents(actorId, limit = 10, offset = 0, includePri
  * 用行为者和目标信息丰富事件数据
  */
 async function enrichEvents(events, viewerId = null) {
+    if (!events.length) return [];
     try {
-        const enriched = await Promise.all(events.map(async (event) => {
-            if (!await canViewContent("activity", event, viewerId)) return null;
-            const [actor, target] = await Promise.all([
-                getActor(event.actor_id),
-                getTarget(event.target_type, event.target_id)
-            ]);
+        const actors = await prisma.ow_users.findMany({
+            where: {
+                id: { in: [...new Set(events.map((event) => Number(event.actor_id)))] },
+                AND: [await visibleWhere("profile", viewerId), await visibleWhere("profile", viewerId, { category: "activity" })],
+            },
+            select: { id: true, username: true, display_name: true, type: true },
+        });
+        const actorMap = new Map(actors.map((actor) => [actor.id, actor]));
+        const definitions = {
+            project: { model: "ow_projects", kind: "project", select: {
+                id: true, name: true, title: true, state: true, authorid: true,
+                author: { select: { id: true, username: true } },
+            } },
+            post: { model: "ow_posts", kind: "post", select: { id: true, author_id: true, post_type: true, content: true, created_at: true } },
+            user: { model: "ow_users", kind: "profile", select: { id: true, username: true, display_name: true, avatar: true } },
+            comment: { model: "ow_comment", kind: "comment", select: { id: true, text: true, user_id: true, page_type: true, page_id: true } },
+            list: { model: "ow_projects_lists", kind: "list", select: { id: true, title: true, description: true, state: true, authorid: true } },
+        };
+        const targets = new Map();
+        await Promise.all(Object.entries(definitions).map(async ([type, definition]) => {
+            const ids = [...new Set(events.filter((event) => actorMap.has(Number(event.actor_id)) && event.target_type === type)
+                .map((event) => Number(event.target_id)))];
+            if (!ids.length) return;
+            const rows = await prisma[definition.model].findMany({
+                where: { id: { in: ids }, AND: [await visibleWhere(definition.kind, viewerId)] },
+                select: definition.select,
+            });
+            for (const target of rows) targets.set(`${type}:${target.id}`, target);
+        }));
 
-            const kind = event.target_type === "user" ? "profile" : event.target_type;
-            if (['profile', 'project', 'post', 'comment', 'list'].includes(kind)) {
-                if (!target || !await canViewContent(kind, target, viewerId)) return null;
-                if (kind === 'comment' && ['project', 'post'].includes(target.page_type)) {
-                    const parent = await getTarget(target.page_type, target.page_id);
-                    if (!await canViewContent(target.page_type, parent, viewerId)) return null;
-                }
-                if (target.author) target.author = await sanitizePublicUser(target.author, viewerId);
-            }
-            const safeActor = await sanitizePublicUser(actor, viewerId);
-            if (!safeActor) return null;
+        const parents = new Set();
+        await Promise.all(["project", "post"].map(async (type) => {
+            const ids = [...new Set([...targets.entries()]
+                .filter(([key, target]) => key.startsWith("comment:") && target.page_type === type)
+                .map(([, target]) => Number(target.page_id)).filter(Number.isSafeInteger))];
+            if (!ids.length) return;
+            const rows = await prisma[definitions[type].model].findMany({
+                where: { id: { in: ids }, AND: [await visibleWhere(type, viewerId)] },
+                select: { id: true },
+            });
+            for (const parent of rows) parents.add(`${type}:${parent.id}`);
+        }));
+
+        const targetEntries = [...targets];
+        const authors = await sanitizeProfiles(targetEntries.map(([, target]) => target.author), viewerId);
+        targetEntries.forEach(([key, target], index) => {
+            if (target.author) targets.set(key, { ...target, author: authors[index] });
+        });
+        const enriched = events.map((event) => {
+            const actor = actorMap.get(Number(event.actor_id));
+            const target = targets.get(`${event.target_type}:${event.target_id}`);
+            if (!actor || !target) return null;
+            if (event.target_type === "comment" && ["project", "post"].includes(target.page_type)
+                && !parents.has(`${target.page_type}:${Number(target.page_id)}`)) return null;
             return {
                 ...event,
                 event_data: {},
-                actor: safeActor,
-                target: {
-                    type: event.target_type,
-                    id: event.target_id,
-                    info: target
-                }
+                actor,
+                target: { type: event.target_type, id: event.target_id, info: target },
             };
-        }));
+        });
         return enriched.filter(Boolean);
     } catch (error) {
         logger.error('丰富事件数据错误:', error);

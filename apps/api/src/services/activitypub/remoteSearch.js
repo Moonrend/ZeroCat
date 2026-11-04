@@ -10,7 +10,7 @@ import { resolveWebFinger } from './federation.js';
 import { ensureProxyUser, resolveAndEnsureProxyUser, searchProxyUsers, REMOTE_USER_TYPE } from './remoteUser.js';
 import { isActorAllowed, isRemoteSearchAllowed } from './federationConfig.js';
 import { prisma } from '../prisma.js';
-import { visibleWhere, sanitizePublicUser } from '../moderation/visibility.js';
+import { visibleWhere, sanitizePublicUser, sanitizeProfiles } from '../moderation/visibility.js';
 
 // 匹配 @user@domain 或 user@domain 格式
 const FEDI_ADDRESS_REGEX = /^@?([a-zA-Z0-9_.-]+)@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})$/;
@@ -84,7 +84,7 @@ export async function federatedUserSearch(keyword, options = {}) {
         }
     }
 
-    result.users = (await Promise.all(localResults.map(user => sanitizePublicUser(user, currentUserId)))).filter(Boolean).slice(0, limit);
+    result.users = (await sanitizeProfiles(localResults, currentUserId)).filter(Boolean).slice(0, limit);
 
     // 如果是联邦地址格式，且联邦启用，同时尝试远程拉取
     if (fediAddr && enabled) {

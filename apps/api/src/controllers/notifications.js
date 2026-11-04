@@ -1238,65 +1238,35 @@ export async function adminSendUnified(unifiedData) {
  * @returns {Promise<Array>} 解析结果数组
  */
 async function resolveRecipients(recipients, recipientType) {
-    const results = [];
-
-    for (const recipient of recipients) {
+    const field = { user_id: 'id', username: 'username', email: 'email' }[recipientType];
+    if (!field) return recipients.map(() => ({ userId: null, error: `不支持的接收者类型: ${recipientType}` }));
+    const keys = recipients.map(recipient => field === 'id' ? Number(recipient) : String(recipient));
+    const validKeys = [...new Set(keys.filter(key => field !== 'id' || (Number.isInteger(key) && key >= -2147483648 && key <= 2147483647)))];
+    if (!validKeys.length) return recipients.map(recipient => ({ userId: null, error: `找不到${recipientType}: ${recipient}` }));
+    const userMap = new Map();
+    const errors = new Map();
+    for (let offset = 0; offset < validKeys.length; offset += 1000) {
+        const batch = validKeys.slice(offset, offset + 1000);
         try {
-            let userInfo = null;
-
-            switch (recipientType) {
-                case 'user_id':
-                    userInfo = await prisma.ow_users.findUnique({
-                        where: { id: Number(recipient) },
-                        select: { id: true, username: true, display_name: true }
-                    });
-                    break;
-
-                case 'username':
-                    userInfo = await prisma.ow_users.findUnique({
-                        where: { username: String(recipient) },
-                        select: { id: true, username: true, display_name: true }
-                    });
-                    break;
-
-                case 'email':
-                    userInfo = await prisma.ow_users.findFirst({
-                        where: { email: String(recipient) },
-                        select: { id: true, username: true, display_name: true, email: true }
-                    });
-                    break;
-
-                default:
-                    results.push({
-                        userId: null,
-                        error: `不支持的接收者类型: ${recipientType}`
-                    });
-                    continue;
-            }
-
-            if (userInfo) {
-                results.push({
-                    userId: userInfo.id,
-                    username: userInfo.username,
-                    displayName: userInfo.display_name,
-                    email: userInfo.email || null
-                });
-            } else {
-                results.push({
-                    userId: null,
-                    error: `找不到${recipientType}: ${recipient}`
-                });
-            }
-
-        } catch (error) {
-            results.push({
-                userId: null,
-                error: `解析${recipientType} ${recipient}时出错: ${error.message}`
+            const users = await prisma.ow_users.findMany({
+                where: { [field]: { in: batch } },
+                select: { id: true, username: true, display_name: true, ...(field === 'email' ? { email: true } : {}) },
             });
+            for (const user of users) {
+                if (!userMap.has(user[field])) userMap.set(user[field], user);
+            }
+        } catch (error) {
+            for (const key of batch) errors.set(key, error.message);
         }
     }
-
-    return results;
+    return recipients.map((recipient, index) => {
+        const key = keys[index];
+        if (errors.has(key)) return { userId: null, error: `解析${recipientType} ${recipient}时出错: ${errors.get(key)}` };
+        const user = userMap.get(key);
+        return user ? {
+            userId: user.id, username: user.username, displayName: user.display_name, email: user.email || null,
+        } : { userId: null, error: `找不到${recipientType}: ${recipient}` };
+    });
 }
 
 /**
@@ -1479,106 +1449,54 @@ export async function getAdminNotificationsListEnhanced(options) {
  *
  * @returns {Promise<Object>} 统计数据
  */
+async function getNotificationCountSummary() {
+    const now = new Date();
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+    const week = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const [counts] = await prisma.$queryRaw`
+        SELECT COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE read = false) AS unread,
+            COUNT(*) FILTER (WHERE hidden = true) AS hidden,
+            COUNT(*) FILTER (WHERE push_error = true) AS push_error,
+            COUNT(*) FILTER (WHERE created_at >= ${today}) AS today,
+            COUNT(*) FILTER (WHERE created_at >= ${week}) AS week
+        FROM ow_notifications
+    `;
+    return Object.fromEntries(Object.entries(counts).map(([key, value]) => [key, Number(value)]));
+}
+
+function getNotificationTypeStats() {
+    return prisma.ow_notifications.groupBy({
+        by: ['notification_type'],
+        _count: { id: true },
+        orderBy: { _count: { id: 'desc' } },
+        take: 10,
+    });
+}
+
 export async function getEnhancedNotificationStats() {
     try {
-        const [
-            totalCount,
-            unreadCount,
-            hiddenCount,
-            pushErrorCount,
-            todayCount,
-            weekCount,
-            typeStats,
-            channelStats
-        ] = await Promise.all([
-            // 总通知数
-            prisma.ow_notifications.count(),
-
-            // 未读通知数
-            prisma.ow_notifications.count({
-                where: { read: false }
-            }),
-
-            // 隐藏通知数
-            prisma.ow_notifications.count({
-                where: { hidden: true }
-            }),
-
-            // 推送错误通知数
-            prisma.ow_notifications.count({
-                where: { push_error: true }
-            }),
-
-            // 今日通知数
-            prisma.ow_notifications.count({
-                where: {
-                    created_at: {
-                        gte: new Date(new Date().setHours(0, 0, 0, 0))
-                    }
-                }
-            }),
-
-            // 本周通知数
-            prisma.ow_notifications.count({
-                where: {
-                    created_at: {
-                        gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-                    }
-                }
-            }),
-
-            // 按类型统计
+        const [counts, typeStats, channelStats] = await Promise.all([
+            getNotificationCountSummary(),
+            getNotificationTypeStats(),
             prisma.ow_notifications.groupBy({
-                by: ['notification_type'],
-                _count: {
-                    id: true
-                },
-                orderBy: {
-                    _count: {
-                        id: 'desc'
-                    }
-                },
-                take: 10
+                by: ['push_channels'],
+                _count: { _all: true },
             }),
-
-            // 按推送渠道统计（需要自定义查询）
-            prisma.ow_notifications.findMany({
-                where: {
-                    push_channels: {
-                        not: null
-                    }
-                },
-                select: {
-                    push_channels: true
-                }
-            })
         ]);
-
-        // 处理推送渠道统计
-        const channelCount = {};
-        channelStats.forEach(notification => {
-            if (notification.push_channels && Array.isArray(notification.push_channels)) {
-                notification.push_channels.forEach(channel => {
-                    channelCount[channel] = (channelCount[channel] || 0) + 1;
-                });
+        const channelCount = new Map();
+        for (const row of channelStats) {
+            if (!Array.isArray(row.push_channels)) continue;
+            for (const channel of row.push_channels) {
+                const key = String(channel);
+                channelCount.set(key, (channelCount.get(key) || 0) + row._count._all);
             }
-        });
-
+        }
         return {
-            total: totalCount,
-            unread: unreadCount,
-            hidden: hiddenCount,
-            push_error: pushErrorCount,
-            today: todayCount,
-            week: weekCount,
-            byType: typeStats.map(stat => ({
-                type: stat.notification_type,
-                count: stat._count.id
-            })),
-            byChannel: Object.entries(channelCount).map(([channel, count]) => ({
-                channel,
-                count
-            }))
+            ...counts,
+            byType: typeStats.map(stat => ({ type: stat.notification_type, count: stat._count.id })),
+            byChannel: [...channelCount].map(([channel, count]) => ({ channel, count })),
         };
     } catch (error) {
         logger.error("获取增强通知统计信息出错:", error);
@@ -1745,59 +1663,16 @@ export async function getAdminNotificationsList(options) {
  */
 export async function getNotificationStats() {
     try {
-        const [
-            totalCount,
-            unreadCount,
-            todayCount,
-            weekCount,
-            typeStats
-        ] = await Promise.all([
-            // 总通知数
-            prisma.ow_notifications.count(),
-
-            // 未读通知数
-            prisma.ow_notifications.count({
-                where: { read: false }
-            }),
-
-            // 今日通知数
-            prisma.ow_notifications.count({
-                where: {
-                    created_at: {
-                        gte: new Date(new Date().setHours(0, 0, 0, 0))
-                    }
-                }
-            }),
-
-            // 本周通知数
-            prisma.ow_notifications.count({
-                where: {
-                    created_at: {
-                        gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-                    }
-                }
-            }),
-
-            // 按类型统计
-            prisma.ow_notifications.groupBy({
-                by: ['notification_type'],
-                _count: {
-                    id: true
-                },
-                orderBy: {
-                    _count: {
-                        id: 'desc'
-                    }
-                },
-                take: 10
-            })
+        const [counts, typeStats] = await Promise.all([
+            getNotificationCountSummary(),
+            getNotificationTypeStats(),
         ]);
 
         return {
-            total: totalCount,
-            unread: unreadCount,
-            today: todayCount,
-            week: weekCount,
+            total: counts.total,
+            unread: counts.unread,
+            today: counts.today,
+            week: counts.week,
             byType: typeStats.map(stat => ({
                 type: stat.notification_type,
                 count: stat._count.id

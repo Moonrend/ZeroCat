@@ -12,7 +12,7 @@ import {createEvent} from "../controllers/events.js";
 import jwt from "jsonwebtoken";
 import * as bcrypt from "bcrypt";
 import {PasswordHash} from "phpass";
-import { changeUsername, getRecommendedUsersForUser, sanitizeFeaturedProjects } from "../controllers/users.js";
+import { changeUsername, getRecommendedUsersForUser, sanitizeFeaturedProjects, sanitizeFeaturedProjectsBatch } from "../controllers/users.js";
 import { buildAvatarURL } from "../utils/avatarUrl.js";
 import { visibleWhere, assertCanWrite } from "../services/moderation/visibility.js";
 
@@ -204,8 +204,9 @@ router.post("/batch/:type", async function (req, res, next) {
         });
 
         // 格式化用户信息
-        const formattedUsers = await Promise.all(usersinfo.map(async (user) => ({
-            ...await sanitizeFeaturedProjects(user, res.locals.userid),
+        const sanitizedUsers = await sanitizeFeaturedProjectsBatch(usersinfo, res.locals.userid);
+        const formattedUsers = await Promise.all(sanitizedUsers.map(async (user) => ({
+            ...user,
             avatarURL: await buildAvatarURL(user.avatar),
             isActive: user.status === "active",
             isAdmin: user.type === "administrator",

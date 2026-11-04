@@ -177,16 +177,36 @@ export async function getUserDataSummary(client, userId) {
 
 async function reconcilePosts(db, ids) {
     await forIds(ids, async (batch) => {
-        const survivors = await db.read("ow_posts", { id: { in: batch } }, { id: true });
-        for (const { id } of survivors) {
-            const reply_count = await db.count("ow_posts", { in_reply_to_id: id, is_deleted: false });
-            const retweet_count = await db.count("ow_posts", {
-                is_deleted: false,
-                OR: [{ retweet_post_id: id, post_type: "retweet" }, { quoted_post_id: id, post_type: "quote" }],
-            });
-            const like_count = await db.count("ow_posts_like", { post_id: id });
-            const bookmark_count = await db.count("ow_posts_bookmark", { post_id: id });
-            await db.call("ow_posts", "updateMany", { where: { id }, data: { reply_count, retweet_count, like_count, bookmark_count } });
+        const survivors = await db.read("ow_posts", { id: { in: batch } }, {
+            id: true, reply_count: true, retweet_count: true, like_count: true, bookmark_count: true,
+        });
+        if (!survivors.length) return;
+        const ids = survivors.map(post => post.id);
+        const countBy = async (model, field, where) => new Map((await db.call(model, "groupBy", {
+            by: [field], where, _count: { _all: true },
+        })).map(row => [row[field], row._count._all]));
+        const replies = await countBy("ow_posts", "in_reply_to_id", { in_reply_to_id: { in: ids }, is_deleted: false });
+        const reposts = await db.call("ow_posts", "groupBy", {
+            by: ["post_type", "retweet_post_id", "quoted_post_id"],
+            where: { is_deleted: false, OR: [
+                { retweet_post_id: { in: ids }, post_type: "retweet" },
+                { quoted_post_id: { in: ids }, post_type: "quote" },
+            ] },
+            _count: { _all: true },
+        });
+        const retweets = new Map();
+        for (const row of reposts) {
+            const id = row.post_type === "retweet" ? row.retweet_post_id : row.quoted_post_id;
+            retweets.set(id, (retweets.get(id) || 0) + row._count._all);
+        }
+        const likes = await countBy("ow_posts_like", "post_id", { post_id: { in: ids } });
+        const bookmarks = await countBy("ow_posts_bookmark", "post_id", { post_id: { in: ids } });
+        for (const post of survivors) {
+            const data = { reply_count: replies.get(post.id) || 0, retweet_count: retweets.get(post.id) || 0,
+                like_count: likes.get(post.id) || 0, bookmark_count: bookmarks.get(post.id) || 0 };
+            if (Object.entries(data).some(([field, count]) => post[field] !== count)) {
+                await db.call("ow_posts", "updateMany", { where: { id: post.id }, data });
+            }
         }
     });
 }
@@ -419,10 +439,16 @@ export async function cleanupUserData(client, userId, categories, { permanent = 
     result.affectedUserIds = bounded(result.affectedUserIds);
     result.assetIds = bounded([...assets]);
     await reconcilePosts(db, result.affectedPostIds);
-    for (const id of result.affectedProjectIds) {
-        const star_count = await db.count("ow_projects_stars", { projectid: id });
-        await db.call("ow_projects", "updateMany", { where: { id }, data: { star_count } });
-    }
+    await forIds(result.affectedProjectIds, async (ids) => {
+        const groups = await db.call("ow_projects_stars", "groupBy", {
+            by: ["projectid"], where: { projectid: { in: ids } }, _count: { _all: true },
+        });
+        const counts = new Map(groups.map(row => [row.projectid, row._count._all]));
+        for (const id of ids) {
+            const star_count = counts.get(id) || 0;
+            await db.call("ow_projects", "updateMany", { where: { id, star_count: { not: star_count } }, data: { star_count } });
+        }
+    });
     // Asset usage can include avatars, thumbnails and shared CAS references;
     // deleting these joins does not establish a complete global usage count.
     return result;

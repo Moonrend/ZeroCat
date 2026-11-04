@@ -1416,19 +1416,14 @@ export async function handleOAuthCallback(provider, code, userIdToBind = null, o
             }
 
             // 检查该 OAuth 账号是否已被其他用户绑定
-            const existingOAuthContact = await prisma.ow_users_contacts.findFirst({
+            const providerContacts = await prisma.ow_users_contacts.findMany({
                 where: {
-                    contact_value: userInfo.id,
-                    contact_type: "oauth_" + provider
-                }
-            });
-
-            const existingUserProviderContact = await prisma.ow_users_contacts.findFirst({
-                where: {
-                    user_id: user.id,
                     contact_type: "oauth_" + provider,
-                }
+                    OR: [{ contact_value: userInfo.id }, { user_id: user.id }],
+                },
             });
+            const existingOAuthContact = providerContacts.find(contact => contact.contact_value === userInfo.id);
+            const existingUserProviderContact = providerContacts.find(contact => contact.user_id === user.id);
 
             if (existingOAuthContact && existingOAuthContact.user_id !== userIdToBind) {
                 logger.warn(`[oauth] OAuth账号已被其他用户绑定: provider=${provider}, oauthId=${userInfo.id}, existingUserId=${existingOAuthContact.user_id}`);

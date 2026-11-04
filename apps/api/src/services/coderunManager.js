@@ -62,6 +62,7 @@ class CodeRunManager {
         const now = new Date();
         const inactiveThreshold = new Date(now.getTime() - reportInterval * 2);
 
+        let changed = false;
         // Check each runner
         for (const [runnerId, runnerData] of this.runners.entries()) {
             if (
@@ -76,12 +77,13 @@ class CodeRunManager {
 
                 // Update local status
                 runnerData.status = "inactive";
+                changed = true;
                 logger.info(`[CodeRunManager] Runner ${runnerId} marked as inactive`);
             }
         }
 
-        // Update cache after changes
-        await this.updateCache();
+        // Persist only when an inactivity transition changed the snapshot.
+        if (changed) await this.updateCache();
     }
 
     async handleRunnerReport(runnerId, reportData) {

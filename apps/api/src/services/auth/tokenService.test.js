@@ -40,6 +40,14 @@ const prisma = { ow_tokens: {
         }
         return { count: rows.length };
     },
+    async updateManyAndReturn(query) {
+        state.order.push("updateManyAndReturn");
+        state.updates.push(query);
+        if (state.dbFailure) throw new Error("simulated database failure");
+        const rows = state.rows.filter(record => matches(record, query.where));
+        for (const row of rows) Object.assign(row, query.data);
+        return structuredClone(rows);
+    },
     async update() { throw new Error("Unexpected activity write in test"); },
 } };
 const redis = {
@@ -232,7 +240,7 @@ test("single revoke is DB-first, idempotent, and rejects old cached access/grace
     assert.equal(result.success, true);
     assert.equal(result.count, 1);
     assert.equal(result.cacheInvalidated, true);
-    assert.deepEqual(state.order, ["findMany", "updateMany", "deleteMany"]);
+    assert.deepEqual(state.order, ["updateManyAndReturn", "deleteMany"]);
     state.rows[0].user.status = "active";
     assert.equal((await service.verifyToken(ACCESS)).valid, false);
     assert.equal((await service.refreshAccessToken(OLD_REFRESH)).success, false);
@@ -259,21 +267,20 @@ test("database revoke failure reports failure and leaves cache untouched", async
     state.dbFailure = true;
     const result = await service.revokeTokensWhere({ user_id: 10 });
     assert.equal(result.success, false);
-    assert.deepEqual(state.order, ["findMany", "updateMany"]);
+    assert.deepEqual(state.order, ["updateManyAndReturn"]);
     assert.equal(state.rows[0].revoked, false);
 });
 
 test("transaction client is used exclusively and invalidation waits for caller commit", async () => {
     const calls = [];
     const db = { ow_tokens: {
-        async findMany(query) { calls.push(["findMany", query]); return [row()]; },
-        async updateMany(query) { calls.push(["updateMany", query]); return { count: 1 }; },
+        async updateManyAndReturn(query) { calls.push(["updateManyAndReturn", query]); return [row()]; },
     } };
     const result = await service.revokeTokensWhere({ user_id: 10, type: "session" }, { db });
     assert.equal(result.success, true);
     assert.equal(result.cacheInvalidated, false);
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1][1].where, { AND: [{ user_id: 10, type: "session" }, { revoked: false }] });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0][1].where, { AND: [{ user_id: 10, type: "session" }, { revoked: false }] });
     assert.deepEqual(state.order, []);
     assert.deepEqual(result.cacheKeys, service.tokenCacheKeysForRecords([row()]));
     const invalidated = await service.invalidateTokenCaches(result.cacheKeys);
@@ -327,21 +334,21 @@ test("old caches remain unusable if refresh races revoke record capture and Redi
     seedAccess(); seedGrace();
     const newAccess = raw("d"), newRefresh = raw("e");
     const db = { ow_tokens: {
-        async findMany() {
-            const captured = structuredClone(state.rows);
+        async updateManyAndReturn(query) {
             state.rows[0].token_hash = service.hashToken(newAccess);
             state.rows[0].refresh_token_hash = service.hashToken(newRefresh);
             state.cache.set("token:cache:" + service.hashToken(newAccess), {
                 tokenId: 7, user: { userid: 10 }, type: "session", scopes: [],
             });
-            return captured;
+            return prisma.ow_tokens.updateManyAndReturn(query);
         },
-        updateMany: prisma.ow_tokens.updateMany,
     } };
     state.redisDeleteFailure = true;
     const result = await service.revokeTokensWhere({ id: 7 }, { db, invalidateCache: true });
     assert.equal(result.success, true);
     assert.equal(result.cacheInvalidated, false);
+    assert.ok(result.cacheKeys.includes("token:cache:" + service.hashToken(newAccess)));
+    assert.ok(result.cacheKeys.includes("refresh:grace:" + service.hashToken(newRefresh)));
     assert.equal((await service.verifyToken(newAccess)).valid, false);
     assert.equal((await service.refreshAccessToken(OLD_REFRESH)).success, false);
 });

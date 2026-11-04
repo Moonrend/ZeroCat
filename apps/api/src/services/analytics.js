@@ -13,37 +13,23 @@ const REMOTE_VIEW_COUNT_KEYS = ["mirror.remote_view_count", "mirror40.remote_vie
 export async function getAnalytics(targetType, targetId, startDate, endDate) {
     const startDateTime = new Date(startDate);
     const endDateTime = new Date(endDate);
+    if (Number.isNaN(startDateTime.getTime()) || Number.isNaN(endDateTime.getTime())) {
+        throw new Error("无效的统计日期范围");
+    }
 
-    // 获取所有时间的统计数据和指定时间段的数据
-    const [allTimeEvents, timeSeriesEvents] = await Promise.all([
-        // 获取所有时间的事件数据（用于总体统计）
-        prisma.ow_analytics_event.findMany({
-            where: {
-                target_type: targetType,
-                target_id: targetId,
-            },
-            include: {
-                device: true,
-            },
-        }),
-        // 获取指定时间段的事件数据（用于时间序列显示）
-        prisma.ow_analytics_event.findMany({
-            where: {
-                target_type: targetType,
-                target_id: targetId,
-                created_at: {
-                    gte: startDateTime,
-                    lte: endDateTime,
-                },
-            },
-            include: {
-                device: true,
-            },
-            orderBy: {
-                created_at: 'asc',
-            },
-        }),
-    ]);
+    // 时间序列是总体数据的子集，共用一次读取并只加载统计所需字段。
+    const allTimeEvents = await prisma.ow_analytics_event.findMany({
+        where: { target_type: targetType, target_id: targetId },
+        select: {
+            device_id: true,
+            referrer_domain: true,
+            country: true,
+            created_at: true,
+            device: { select: { browser: true, os: true, device_type: true } },
+        },
+    });
+    const timeSeriesEvents = allTimeEvents.filter(event =>
+        event.created_at >= startDateTime && event.created_at <= endDateTime);
 
     // 处理总体统计数据
     const processAllTimeStats = (events) => {

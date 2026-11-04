@@ -207,18 +207,14 @@ export async function getOAuthBindingStatus(userId) {
         where: {
             user_id: userId,
             contact_type: { in: ['oauth_twitter', 'oauth_bluesky'] },
-        },
-        select: {
-            contact_type: true,
             verified: true,
-            metadata: true,
-            updated_at: true,
         },
+        select: { contact_type: true },
     });
 
     const map = {
-        twitter: contacts.some((item) => item.contact_type === 'oauth_twitter' && item.verified),
-        bluesky: contacts.some((item) => item.contact_type === 'oauth_bluesky' && item.verified),
+        twitter: contacts.some((item) => item.contact_type === 'oauth_twitter'),
+        bluesky: contacts.some((item) => item.contact_type === 'oauth_bluesky'),
     };
 
     return map;

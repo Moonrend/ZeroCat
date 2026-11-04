@@ -11,6 +11,9 @@ mock.module('../services/global.js', { namedExports: { S3update: noop } });
 mock.module('../services/redis.js', { defaultExport: {} });
 mock.module('../services/projectCollaborationService.js', { namedExports: { userCanActOnProject: async () => true } });
 mock.module('../services/auth/permissionManager.js', { namedExports: { hasProjectPermission: async () => true } });
+mock.module('../services/projectFileStorage.js', { namedExports: {
+    readProjectFile: async () => { state.fileReads++; return { source: 'extension source' }; },
+} });
 mock.module('../services/extensionReview.js', { namedExports: { setReviewStatus: noop, isAutoApproveUser: async () => false } });
 mock.module('../controllers/projects.js', { namedExports: {
     getProjectById: async () => state.project,
@@ -29,15 +32,23 @@ mock.module('../services/auth/authorization.js', { namedExports: { authorize: as
 mock.module('../services/moderation/visibility.js', { namedExports: {
     canViewContent: async (kind, record) => Boolean(record) && !state.hidden,
     sanitizeProfile: async user => state.hiddenProfile ? null : user,
-    visibleWhere: async () => ({ moderation_guard: true }),
+    sanitizeProfiles: async users => { state.profileBatches++; return users.map(user => state.hiddenProfile ? null : user); },
+    visibleWhere: async kind => ({ moderation_guard: true, ...(kind === 'profile' ? { hidden_profile: state.hiddenProfile } : {}) }),
 } });
 mock.module('../services/prisma.js', { namedExports: { prisma: {
-    ow_projects: { findFirst: async () => state.project },
-    ow_users: { findMany: async () => [{ id: 3, username: 'hidden-profile' }] },
+    $queryRaw: async (_sql, ...values) => values.includes('tip') ? [{ id: 'tip', parent_commit_id: null, commit_file: 'file' }] : [],
+    ow_projects: { findFirst: async () => state.project,
+        findMany: async () => { state.sampleReads++; return state.visibleSamples; } },
+    ow_users: { findMany: async ({ where }) => where.AND?.some(filter => filter.hidden_profile)
+        ? [] : [{ id: 3, username: 'hidden-profile' }] },
     ow_target_configs: { findMany: async () => [] },
     ow_events: { findMany: async () => [{ id: 1, actor_id: 3, event_data: { user: 'old-hidden-profile', value: '5' } }] },
     project_clouddata_history: { findMany: async () => [{ id: 1, actor_id: 3, actor_name: 'old-hidden-profile', value: '5' }] },
-    ow_scratch_extensions: { findFirst: async () => structuredClone(state.extension), findUnique: async () => structuredClone(state.extension) },
+    ow_scratch_extensions: {
+        findMany: async () => { state.extensionReads++; return structuredClone(state.extensionRows); },
+        findFirst: async () => { state.extensionReads++; return structuredClone(state.extension); },
+        findUnique: async () => { state.extensionReads++; return structuredClone(state.extension); },
+    },
     ow_projects_branch: { findMany: async () => [{ latest_commit_hash: 'tip' }], findFirst: async () => ({ latest_commit_hash: 'tip' }) },
     ow_projects_commits: { findUnique: async ({ where }) => ({ id: where.id, parent_commit_id: null, commit_file: 'file' }) },
     ow_projects_file: { findFirst: async () => { state.fileReads++; return { source: 'extension source' }; } },
@@ -55,7 +66,8 @@ function response(locals = {}) {
 const next = error => { if (error) throw error; };
 beforeEach(() => {
     const project = { id: 7, authorid: 9, state: 'public', type: 'scratch', default_branch: 'main', source: 'public-file', devsource: 'private-file' };
-    Object.assign(state, { project, hidden: false, hiddenProfile: false, denied: false, fileReads: 0, authorizations: [],
+    Object.assign(state, { project, hidden: false, hiddenProfile: false, denied: false, fileReads: 0, extensionReads: 0, authorizations: [],
+        sampleReads: 0, profileBatches: 0, visibleSamples: [], extensionRows: [],
         signedToken: { data: { projectid: 7, userid: 3, authorizationContext: { tokenType: 'session', tokenScopes: [] } } },
         extension: { id: 5, status: 'verified', projectid: 7, branch: 'main', commit: 'tip', project },
     });
@@ -121,6 +133,42 @@ for (const [path, key, actorName] of [
         assert.equal(res.body[key][0].value, '5');
     });
 }
+
+test('extension management reuses the authorized extension within the same request', async () => {
+    state.extension.commit = 'latest';
+    const res = response({ userid: 9, tokenType: 'session', scopes: [] });
+    const req = { params: { id: '5' } };
+    let continued = false;
+    await handler(extensions, '/manager/update/:id', 'requireExtensionProject')(req, res, () => { continued = true; });
+    assert.equal(continued, true);
+    await handler(extensions, '/manager/update/:id')(req, res, next);
+    assert.equal(res.body.status, 'success');
+    assert.equal(res.body.data.commit, 'latest');
+    assert.equal(state.extensionReads, 1);
+});
+
+test('extension batches share sample visibility and redact author profiles without changing order', async () => {
+    state.hiddenProfile = true;
+    state.extensionRows = [5, 6].map(id => ({ ...state.extension, id,
+        project: { ...state.project, author: { id: 9, username: 'hidden' } },
+        sample_project: { id: 20, name: 'private sample' } }));
+    const res = response({ userid: 3, tokenType: 'session', scopes: [] });
+    await handler(extensions, '/detail/batch')({ body: { ids: [6, 5] } }, res, next);
+    assert.deepEqual(res.body.data.map(item => item.id), [6, 5]);
+    assert.ok(res.body.data.every(item => item.data.project.author === null && item.data.sample_project === null));
+    assert.equal(state.sampleReads, 1);
+    assert.equal(state.profileBatches, 1);
+    assert.equal(state.authorizations.length, 4);
+});
+
+test('extension batch reads still enforce the backing project token scope', async () => {
+    state.extensionRows = [state.extension];
+    const res = response({ userid: 3, tokenType: 'oauth', scopes: ['extension:5:read'] });
+    await handler(extensions, '/detail/batch')({ body: { ids: [5] } }, res, next);
+    assert.equal(res.body.data[0].exists, false);
+    assert.equal(state.sampleReads, 0);
+    assert.deepEqual(state.authorizations.map(context => context.requiredScope), ['extension:5:read', 'project:7:read']);
+});
 
 test('extension management also rechecks its backing project current write policy', async () => {
     state.denied = true;

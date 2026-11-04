@@ -19,6 +19,7 @@ RUN pnpm install --frozen-lockfile
 
 # 仅复制后端应用代码，避免引入无关目录影响构建速度
 COPY apps/api ./apps/api
+COPY scripts/migrate-project-files-to-s3.js ./scripts/migrate-project-files-to-s3.js
 
 # 切换到后端目录并生成 Prisma Client
 WORKDIR /app/apps/api

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { createHash } from "crypto";
+import { pathToFileURL } from "node:url";
 import { prisma } from "../apps/api/src/services/prisma.js";
+import { saveProjectFile } from "../apps/api/src/services/projectFileStorage.js";
 import logger from "../apps/api/src/services/logger.js";
 import defaultProject from "../apps/api/src/default_project.js";
 
@@ -215,25 +217,13 @@ async function saveSource(source, userId, dryRun) {
   const sha256 = makeSourceSha(source);
 
   if (!dryRun) {
-    try {
-      await prisma.ow_projects_file.create({
-        data: {
-          sha256,
-          source,
-          create_userid: userId,
-        },
-      });
-    } catch (error) {
-      if (error?.code !== "P2002") {
-        throw error;
-      }
-    }
+    await saveProjectFile(source, { userId, sha256, db: prisma });
   }
 
   return sha256;
 }
 
-async function createMigrationCommit(project, user, motto, dryRun) {
+export async function createMigrationCommit(project, user, motto, dryRun) {
   const projectId = Number(project.id);
 
   const latestCommit = await prisma.ow_projects_commits.findFirst({
@@ -242,12 +232,12 @@ async function createMigrationCommit(project, user, motto, dryRun) {
       branch: DEFAULT_BRANCH,
     },
     orderBy: { commit_date: "desc" },
-    select: { id: true },
+    select: { id: true, commit_file: true, commit_message: true },
   });
 
   const parentCommitId = latestCommit?.id || null;
   const source = `${motto.trim()}\n`;
-  const sourceSha = await saveSource(source, user.id, dryRun);
+  const sourceSha = makeSourceSha(source);
 
   if (
     latestCommit?.commit_file === sourceSha &&
@@ -256,6 +246,7 @@ async function createMigrationCommit(project, user, motto, dryRun) {
     return { commitId: latestCommit.id, sourceSha, created: false };
   }
 
+  await saveSource(source, user.id, dryRun);
   const timestamp = Date.now();
   const commitPayload = {
     userid: user.id,
@@ -477,11 +468,13 @@ async function main() {
   logger.info(`[motto-migration] 统计: ${JSON.stringify(stats)}`);
 }
 
-main()
-  .catch((error) => {
-    logger.error("[motto-migration] 迁移执行异常:", error);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main()
+    .catch((error) => {
+      logger.error("[motto-migration] 迁移执行异常:", error);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}

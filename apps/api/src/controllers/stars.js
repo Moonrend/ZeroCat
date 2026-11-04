@@ -95,35 +95,19 @@ export async function unstarProject(userId, projectId) {
             throw Object.assign(new Error('项目不存在'), { statusCode: 404, code: 'RESOURCE_NOT_FOUND' });
         }
 
-        // 检查用户是否已收藏该项目
-        const existingStar = await prisma.ow_projects_stars.findFirst({
-            where: {
-                userid: parsedUserId,
-                projectid: parsedProjectId,
+        const star = await prisma.$transaction(async (tx) => {
+            const deleted = await tx.ow_projects_stars.deleteMany({
+                where: { userid: parsedUserId, projectid: parsedProjectId },
+            });
+            if (deleted.count > 0) {
+                await tx.ow_projects.update({
+                    where: { id: parsedProjectId },
+                    data: { star_count: { decrement: deleted.count } },
+                });
             }
+            return deleted;
         });
-
-        if (!existingStar) {
-            return {count: 0};
-        }
-
-        // 删除收藏记录
-        const star = await prisma.ow_projects_stars.deleteMany({
-            where: {
-                userid: parsedUserId,
-                projectid: parsedProjectId,
-            }
-        });
-
-        // 更新项目收藏数
-        await prisma.ow_projects.update({
-            where: {id: parsedProjectId},
-            data: {
-                star_count: {
-                    decrement: 1
-                }
-            }
-        });
+        if (!star.count) return star;
 
         // Gorse 反馈：取消项目收藏
         queueManager.enqueueProjectGorseSync(parsedProjectId, { reason: 'project_unstar', delayMs: 0 }).catch(e => {

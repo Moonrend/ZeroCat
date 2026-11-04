@@ -83,7 +83,7 @@ const countSelect = {
 /**
  * 按 client_id 或 数字 id 查找应用
  */
-async function findApplicationByIdentifier(identifier, { includeDeleted = true } = {}) {
+async function findApplicationByIdentifier(identifier, { includeDeleted = true, select } = {}) {
     const raw = String(identifier || "").trim();
     if (!raw) return null;
 
@@ -98,10 +98,12 @@ async function findApplicationByIdentifier(identifier, { includeDeleted = true }
 
     return prisma.ow_oauth_applications.findFirst({
         where,
-        include: {
-            owner: { select: ownerSelect },
-            _count: { select: countSelect },
-        },
+        ...(select ? { select } : {
+            include: {
+                owner: { select: ownerSelect },
+                _count: { select: countSelect },
+            },
+        }),
     });
 }
 
@@ -243,7 +245,7 @@ router.get("/applications/:identifier", async (req, res) => {
  */
 router.put("/applications/:identifier", async (req, res) => {
     try {
-        const application = await findApplicationByIdentifier(req.params.identifier);
+        const application = await findApplicationByIdentifier(req.params.identifier, { select: { id: true, type: true } });
         if (!application) {
             return res.status(404).json({ status: "error", message: "Application not found" });
         }
@@ -366,7 +368,7 @@ router.put("/applications/:identifier", async (req, res) => {
  */
 async function setVerifiedHandler(req, res) {
     try {
-        const application = await findApplicationByIdentifier(req.params.identifier);
+        const application = await findApplicationByIdentifier(req.params.identifier, { select: { id: true, is_verified: true } });
         if (!application) {
             return res.status(404).json({ status: "error", message: "Application not found" });
         }
@@ -402,7 +404,7 @@ router.post("/applications/:identifier/verified", setVerifiedHandler);
  */
 async function setAutoAuthorizeHandler(req, res) {
     try {
-        const application = await findApplicationByIdentifier(req.params.identifier);
+        const application = await findApplicationByIdentifier(req.params.identifier, { select: { id: true } });
         if (!application) {
             return res.status(404).json({ status: "error", message: "Application not found" });
         }
@@ -445,7 +447,7 @@ router.post("/applications/:identifier/auto-authorize", setAutoAuthorizeHandler)
  */
 router.delete("/applications/:identifier", async (req, res) => {
     try {
-        const application = await findApplicationByIdentifier(req.params.identifier);
+        const application = await findApplicationByIdentifier(req.params.identifier, { select: { id: true, status: true } });
         if (!application) {
             return res.status(404).json({ status: "error", message: "Application not found" });
         }

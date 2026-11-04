@@ -209,27 +209,16 @@ export async function getUserInfoForToken(user, email = null) {
     try {
         // 如果未提供邮箱，尝试获取用户的主要邮箱
         if (!email) {
-            // 获取用户的主要邮箱联系方式
-            const primaryEmail = await prisma.ow_users_contacts.findFirst({
+            const contact = await prisma.ow_users_contacts.findFirst({
                 where: {
                     user_id: user.id,
                     contact_type: "email",
-                    is_primary: true,
-                }
+                    OR: [{ is_primary: true }, { verified: true }],
+                },
+                orderBy: { is_primary: "desc" },
+                select: { contact_value: true },
             });
-
-            // 如果没有主要邮箱，获取任何已验证的邮箱
-            const verifiedEmail = !primaryEmail
-                ? await prisma.ow_users_contacts.findFirst({
-                    where: {
-                        user_id: user.id,
-                        contact_type: "email",
-                        verified: true,
-                    }
-                })
-                : null;
-
-            email = primaryEmail?.contact_value || verifiedEmail?.contact_value || null;
+            email = contact?.contact_value || null;
         }
 
         return {

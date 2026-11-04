@@ -322,17 +322,15 @@ export async function buildUserOutbox(username, page = 0, pageSize = 20) {
 
     if (!user) return null;
 
-    // 获取帖子总数（含转推）
-    const totalItems = await prisma.ow_posts.count({
-        where: {
-            author_id: user.id,
-            is_deleted: false,
-            AND: [await visibleWhere('post')],
-            post_type: { in: ['normal', 'reply', 'quote', 'retweet'] },
-        },
-    });
-
     if (page === 0) {
+        const totalItems = await prisma.ow_posts.count({
+            where: {
+                author_id: user.id,
+                is_deleted: false,
+                AND: [await visibleWhere('post')],
+                post_type: { in: ['normal', 'reply', 'quote', 'retweet'] },
+            },
+        });
         return buildOrderedCollection(outboxUrl, totalItems, `${outboxUrl}?page=1`);
     }
 
@@ -352,14 +350,24 @@ export async function buildUserOutbox(username, page = 0, pageSize = 20) {
         skip: (page - 1) * pageSize,
     });
 
+    // Recheck referenced originals together and load their AP IDs in the same query.
+    const retweetIds = [...new Set(posts.filter(post => post.post_type === 'retweet' && post.retweet_post_id)
+        .map(post => post.retweet_post_id))];
+    const originals = retweetIds.length ? await prisma.ow_posts.findMany({
+        where: { id: { in: retweetIds }, AND: [await visibleWhere('post')] },
+        select: { id: true, platform_refs: true },
+    }) : [];
+    const originalById = new Map(originals.map(post => [post.id, post]));
+
     // 转换为 AP 活动
     const actorUrl = await getActorUrl(username);
     const items = [];
     for (const post of posts) {
         if (post.post_type === 'retweet' && post.retweet_post_id) {
-            if (!await prisma.ow_posts.findFirst({ where: { id: post.retweet_post_id, AND: [await visibleWhere('post')] }, select: { id: true } })) continue;
+            const original = originalById.get(post.retweet_post_id);
+            if (!original) continue;
             // 转推 → Announce 活动
-            const originalNoteId = await getPostApId(post.retweet_post_id)
+            const originalNoteId = original.platform_refs?.activitypub?.id
                 || await getNoteId(post.retweet_post_id);
             const activity = await buildAnnounceActivity(actorUrl, originalNoteId);
             items.push(activity);

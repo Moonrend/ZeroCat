@@ -15,14 +15,13 @@ import {
     getUserResourceRoleScopes,
     listResourceGrants,
     listUserScopedGrants,
-    revokeScopedRole,
 } from "./auth/policyEngine.js";
 import {
     COLLABORATION_ROLE_KEYS,
     SYSTEM_ROLE_KEYS,
 } from "./auth/rolePermissions.js";
 import { createNotification } from "../controllers/notifications.js";
-import { visibleWhere, canViewContent, sanitizeProfile } from "./moderation/visibility.js";
+import { visibleWhere, canViewContent, sanitizeProfiles } from "./moderation/visibility.js";
 import { assertCanWrite } from "./moderation/restrictions.js";
 
 export const PROJECT_TARGET_TYPE = "project";
@@ -95,12 +94,15 @@ export async function canManageCollaborators(userId, projectId) {
 }
 
 /** 是否为项目作者或在册协作者（用于成员名单可见性）。 */
-export async function isProjectMemberOrOwner(userId, projectId) {
-    const project = await getProject(projectId);
+async function projectMemberOrOwner(userId, project) {
     if (!project || !(await canViewContent("project", project, userId))) return false;
     if (Number(project.authorid) === Number(userId)) return true;
     const scopes = await getCollabScopes(userId, project.id);
     return scopes.length > 0;
+}
+
+export async function isProjectMemberOrOwner(userId, projectId) {
+    return projectMemberOrOwner(userId, await getProject(projectId));
 }
 
 /**
@@ -119,16 +121,10 @@ export async function getMyProjectAccess(userId, { projectId, authorname, projec
             });
         }
     } else if (authorname && projectname) {
-        const author = await prisma.ow_users.findUnique({
-            where: { username: String(authorname) },
-            select: { id: true },
+        project = await prisma.ow_projects.findFirst({
+            where: { name: String(projectname), author: { is: { username: String(authorname) } } },
+            select: { id: true, authorid: true, state: true, type: true, deleted_at: true, is_shadowbanned: true, shadowban_expires_at: true },
         });
-        if (author) {
-            project = await prisma.ow_projects.findFirst({
-                where: { name: String(projectname), authorid: author.id },
-                select: { id: true, authorid: true, state: true, type: true, deleted_at: true, is_shadowbanned: true, shadowban_expires_at: true },
-            });
-        }
     }
     if (!project || !(await canViewContent("project", project, userId))) return null;
 
@@ -338,6 +334,7 @@ export async function listReceivedInvitations(userId) {
             invitee_id: Number(userId),
             status: "pending",
             OR: [{ expires_at: null }, { expires_at: { gt: new Date() } }],
+            project: { is: await visibleWhere("project", userId, { ignorePrivacy: true }) },
         },
         orderBy: { created_at: "desc" },
         include: {
@@ -351,34 +348,31 @@ export async function listReceivedInvitations(userId) {
             inviter: { select: { id: true, username: true, display_name: true, avatar: true } },
         },
     });
-    const visible = await Promise.all(rows.map(async (invitation) => {
-        if (!(await canViewContent("project", invitation.project, userId, { ignorePrivacy: true }))) return null;
-        return formatInvitation({
-            ...invitation,
-            project: { ...invitation.project, author: await sanitizeProfile(invitation.project.author, userId) },
-            inviter: await sanitizeProfile(invitation.inviter, userId),
-        });
+    const profiles = await sanitizeProfiles(rows.flatMap(invitation => [invitation.project.author, invitation.inviter]), userId);
+    return rows.map((invitation, index) => formatInvitation({
+        ...invitation,
+        project: { ...invitation.project, author: profiles[index * 2] },
+        inviter: profiles[index * 2 + 1],
     }));
-    return visible.filter(Boolean);
 }
 
 /** 项目作者/成员：成员名单 + 待处理邀请。 */
 export async function listProjectMembers(projectId, viewerId) {
     const project = await getProject(projectId);
-    if (!project || !(await isProjectMemberOrOwner(viewerId, projectId))) throw new CollaborationError("项目不存在", 404);
+    if (!project || !(await projectMemberOrOwner(viewerId, project))) throw new CollaborationError("项目不存在", 404);
 
     const grants = await listResourceGrants(PROJECT_TARGET_TYPE, String(project.id));
-    const collaborators = await Promise.all(grants
-        .filter((grant) => isCollaborationRole(grant.role_key))
-        .map(async (grant) => ({
-            user_id: grant.user_id,
-            user: await sanitizeProfile(grant.user, viewerId),
-            role_key: grant.role_key,
-            role_label: COLLABORATION_ROLE_LABELS[grant.role_key] || grant.role_name,
-            grant_type: grant.grant_type,
-            assigned_by_user: await sanitizeProfile(grant.assigned_by_user, viewerId),
-            created_at: grant.created_at,
-        })));
+    const collaborationGrants = grants.filter(grant => isCollaborationRole(grant.role_key));
+    const profiles = await sanitizeProfiles(collaborationGrants.flatMap(grant => [grant.user, grant.assigned_by_user]), viewerId);
+    const collaborators = collaborationGrants.map((grant, index) => ({
+        user_id: grant.user_id,
+        user: profiles[index * 2],
+        role_key: grant.role_key,
+        role_label: COLLABORATION_ROLE_LABELS[grant.role_key] || grant.role_name,
+        grant_type: grant.grant_type,
+        assigned_by_user: profiles[index * 2 + 1],
+        created_at: grant.created_at,
+    }));
 
     const invitationRows = await prisma.ow_project_collaboration_invitations.findMany({
         where: {
@@ -398,9 +392,8 @@ export async function listProjectMembers(projectId, viewerId) {
             authorid: project.authorid,
         },
         collaborators,
-        invitations: await Promise.all(invitationRows.map(async (invitation) => formatInvitation({
-            ...invitation, invitee: await sanitizeProfile(invitation.invitee, viewerId),
-        }))),
+        invitations: (await sanitizeProfiles(invitationRows.map(invitation => invitation.invitee), viewerId))
+            .map((invitee, index) => formatInvitation({ ...invitationRows[index], invitee })),
     };
 }
 
@@ -419,15 +412,7 @@ export async function updateMemberRole({ projectId, actorId, memberUserId, roleK
     }
 
     await prisma.$transaction(async (tx) => {
-        for (const key of COLLABORATION_ROLE_KEYS) {
-            if (key !== roleKey) {
-                await revokeScopedRole(memberUserId, key, {
-                    targetType: PROJECT_TARGET_TYPE,
-                    targetId: String(project.id),
-                    db: tx,
-                });
-            }
-        }
+        await revokeAllCollaborationRoles(tx, memberUserId, project.id, roleKey);
         await assignScopedRole(memberUserId, roleKey, {
             targetType: PROJECT_TARGET_TYPE,
             targetId: String(project.id),
@@ -441,14 +426,17 @@ export async function updateMemberRole({ projectId, actorId, memberUserId, roleK
     return { user_id: Number(memberUserId), role_key: roleKey };
 }
 
-async function revokeAllCollaborationRoles(tx, userId, projectId) {
-    for (const key of COLLABORATION_ROLE_KEYS) {
-        await revokeScopedRole(userId, key, {
-            targetType: PROJECT_TARGET_TYPE,
-            targetId: String(projectId),
-            db: tx,
-        });
-    }
+async function revokeAllCollaborationRoles(tx, userId, projectId, keepRoleKey = null) {
+    const id = Number(userId);
+    if (!Number.isInteger(id) || id <= 0) throw new Error("无效的用户 ID");
+    await tx.ow_user_roles.deleteMany({
+        where: {
+            user_id: id,
+            target_type: PROJECT_TARGET_TYPE,
+            target_id: String(projectId),
+            role: { key: { in: COLLABORATION_ROLE_KEYS.filter(key => key !== keepRoleKey) } },
+        },
+    });
 }
 
 /** 作者/管理员：移除成员。 */
@@ -520,7 +508,8 @@ export async function listMyCollaborations(userId) {
             },
         })
         : [];
-    const safeProjects = await Promise.all(projects.map(async (project) => ({ ...project, author: await sanitizeProfile(project.author, userId) })));
+    const authors = await sanitizeProfiles(projects.map(project => project.author), userId);
+    const safeProjects = projects.map((project, index) => ({ ...project, author: authors[index] }));
     const projectMap = new Map(safeProjects.map((project) => [project.id, project]));
 
     return projectGrants.filter((grant) => projectMap.has(Number(grant.target_id))).map((grant) => ({

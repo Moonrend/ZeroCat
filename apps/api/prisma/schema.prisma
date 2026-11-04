@@ -366,13 +366,23 @@ model ow_user_embedding_updates {
 
 // 项目文件表
 model ow_projects_file {
-  sha256        String    @id @db.VarChar(64)
-  source        String?
-  create_time   DateTime? @default(now()) @db.Timestamp(6)
-  create_userid Int?
+  sha256           String                  @id @db.VarChar(64)
+  // Legacy inline body; new writes store only a private S3 pointer.
+  source           String?
+  storage_provider String?                 @db.VarChar(16)
+  storage_bucket   String?                 @db.VarChar(255)
+  storage_key      String?                 @db.Text
+  content_size     BigInt?
+  content_sha256   String?                 @db.VarChar(64)
+  content_type     String?                 @db.VarChar(255)
+  search_preview   String?                 @db.Text
+  search_vector    Unsupported("tsvector")?
+  create_time      DateTime?               @default(now()) @db.Timestamp(6)
+  create_userid    Int?
 
   @@index([create_time], map: "idx_ow_projects_file_create_time")
   @@index([create_userid], map: "idx_ow_projects_file_create_userid")
+  @@index([search_vector], type: Gin, map: "idx_ow_projects_file_search_vector")
   @@map("ow_projects_file")
 }
 

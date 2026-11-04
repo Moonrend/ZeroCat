@@ -301,21 +301,20 @@ export async function getAuthMethods(req, res) {
 
         // 如果能够识别用户，则依据其真实拥有的认证方式过滤（防枚举：未识别用户保留基础集合）
         if (userId) {
-            const [totpContact, passkeyContact, emailContact] = await Promise.all([
-                prisma.ow_users_contacts.findFirst({
-                    where: { user_id: Number(userId), contact_type: 'totp' }
-                }),
-                prisma.ow_users_contacts.findFirst({
-                    where: { user_id: Number(userId), contact_type: 'passkey', verified: true }
-                }),
-                prisma.ow_users_contacts.findFirst({
-                    where: {
-                        user_id: Number(userId),
-                        contact_type: 'email',
-                        OR: [{ is_primary: true }, { verified: true }]
-                    }
-                })
-            ]);
+            const contacts = await prisma.ow_users_contacts.findMany({
+                where: {
+                    user_id: Number(userId),
+                    OR: [
+                        { contact_type: 'totp' },
+                        { contact_type: 'passkey', verified: true },
+                        { contact_type: 'email', OR: [{ is_primary: true }, { verified: true }] },
+                    ],
+                },
+                select: { contact_type: true, verified: true, metadata: true },
+            });
+            const totpContact = contacts.find(contact => contact.contact_type === 'totp');
+            const passkeyContact = contacts.find(contact => contact.contact_type === 'passkey');
+            const emailContact = contacts.find(contact => contact.contact_type === 'email');
 
             const hasTotp = !!totpContact && !!totpContact.verified && totpContact.metadata?.enabled === true;
             const hasPasskey = !!passkeyContact && Array.isArray(passkeyContact.metadata?.credentials) && passkeyContact.metadata.credentials.length > 0;

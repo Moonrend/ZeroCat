@@ -78,24 +78,17 @@ async function getPostMentions(postId) {
 async function resolveRelatedNoteRef(relatedPostId, relatedPost = null) {
     if (!relatedPostId) return null;
 
-    if (!await prisma.ow_posts.findFirst({ where: { id: Number(relatedPostId), AND: [await visibleWhere('post')] }, select: { id: true } })) return null;
-    let candidate = relatedPost;
     const hasReferenceFields =
-        candidate &&
-        typeof candidate === 'object' &&
-        Object.prototype.hasOwnProperty.call(candidate, 'platform_refs') &&
-        Object.prototype.hasOwnProperty.call(candidate, 'metadata');
-
-    if (!hasReferenceFields) {
-        candidate = await prisma.ow_posts.findUnique({
-            where: { id: relatedPostId },
-            select: {
-                id: true,
-                platform_refs: true,
-                metadata: true,
-            },
-        });
-    }
+        relatedPost &&
+        typeof relatedPost === 'object' &&
+        Object.prototype.hasOwnProperty.call(relatedPost, 'platform_refs') &&
+        Object.prototype.hasOwnProperty.call(relatedPost, 'metadata');
+    const visible = await prisma.ow_posts.findFirst({
+        where: { id: Number(relatedPostId), AND: [await visibleWhere('post')] },
+        select: hasReferenceFields ? { id: true } : { id: true, platform_refs: true, metadata: true },
+    });
+    if (!visible) return null;
+    const candidate = hasReferenceFields ? relatedPost : visible;
 
     const isRemoteProxyPost = Boolean(candidate?.metadata?.remote);
     const apId = candidate?.platform_refs?.activitypub?.id;

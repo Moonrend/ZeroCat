@@ -12,68 +12,16 @@ const require = createRequire(import.meta.url);
 const disposableDomains = require('disposable-domains');
 //prisma client
 import { prisma } from "./prisma.js";
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { putObject } from "./objectStorage.js";
 
 const pwdHash = new PasswordHash();
-const s3config = {
-    endpoint: await zcconfig.get("s3.endpoint"),
-    region: await zcconfig.get("s3.region"),
-    forcePathStyle: await zcconfig.get("s3.forcePathStyle"),
-    credentials: {
-        accessKeyId: await zcconfig.get("s3.AWS_ACCESS_KEY_ID"),
-        secretAccessKey: await zcconfig.get("s3.AWS_SECRET_ACCESS_KEY"),
-    },
-};
-//logger.debug(s3config);
-
-const s3 = new S3Client(s3config);
-
-/**
- * 判断错误是否为可重试的瞬时错误（网络/TLS/连接相关）
- */
-function isRetryableS3Error(error) {
-  const message = error.message || '';
-  if (message.includes('Client network socket disconnected before secure TLS connection was established')) return true;
-  if (message.includes('socket hang up')) return true;
-  const codes = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN',
-    'EPIPE', 'ERR_TLS_SOCKET_DISCONNECTED', 'ETLS'];
-  if (codes.includes(error.code)) return true;
-  if (error.$metadata && error.$metadata.httpStatusCode >= 500) return true;
-  if (error.$metadata && error.$metadata.httpStatusCode === 429) return true;
-  return false;
-}
-
-/**
- * 带指数退避重试的 S3 操作
- */
-async function s3WithRetry(fn, maxRetries = 3, baseDelayMs = 500) {
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      if (attempt < maxRetries && isRetryableS3Error(error)) {
-        const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 200;
-        logger.warn(`S3操作失败 (尝试 ${attempt + 1}/${maxRetries + 1}): ${error.message}，${delay.toFixed(0)}ms 后重试...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      } else {
-        throw error;
-      }
-    }
-  }
-  throw lastError;
-}
-
 async function S3update(name, fileContent) {
     try {
-        const command = new PutObjectCommand({
-            Bucket: await zcconfig.get("s3.bucket"),
-            Key: name,
-            Body: fileContent,
+        const data = await putObject({
+            bucket: await zcconfig.get("s3.bucket"),
+            key: name,
+            body: fileContent,
         });
-
-        const data = await s3WithRetry(() => s3.send(command));
         logger.debug(data);
         logger.debug(
             `成功上传了文件 ${await zcconfig.get("s3.bucket")}/${name}`

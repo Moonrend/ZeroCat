@@ -5,6 +5,23 @@ import { buildAvatarURL } from "../utils/avatarUrl.js";
 import {validateUsername} from "../services/global.js";
 import { visibleWhere, assertCanWrite } from "../services/moderation/visibility.js";
 
+export async function sanitizeFeaturedProjectsBatch(users, viewerId = null) {
+    const projectIds = [...new Set(users.filter(user => user?.featured_projects).map(user => Number(user.featured_projects)))];
+    if (!projectIds.length) return users;
+    const visibility = await visibleWhere("project", viewerId);
+    const visibleIds = new Set();
+    for (let offset = 0; offset < projectIds.length; offset += 1000) {
+        const projects = await prisma.ow_projects.findMany({
+            where: { id: { in: projectIds.slice(offset, offset + 1000) }, AND: [visibility] },
+            select: { id: true },
+        });
+        for (const project of projects) visibleIds.add(project.id);
+    }
+    return users.map(user => user?.featured_projects
+        ? { ...user, featured_projects: visibleIds.has(Number(user.featured_projects)) ? Number(user.featured_projects) : null }
+        : user);
+}
+
 export async function sanitizeFeaturedProjects(user, viewerId = null) {
     if (!user?.featured_projects) return user;
     const project = await prisma.ow_projects.findFirst({

@@ -1,4 +1,4 @@
-import {createHash} from 'crypto';
+import {saveProjectFile} from './projectFileStorage.js';
 import {SitemapStream, streamToPromise} from 'sitemap';
 import {Readable} from 'stream';
 import {createGzip} from 'zlib';
@@ -122,19 +122,8 @@ class SitemapService {
             // 获取最终的buffer
             const buffer = await streamToPromise(pipeline);
 
-            // 计算SHA256哈希
-            const hash = createHash('sha256').update(buffer).digest('hex');
-
-            // 保存到ow_projects_file
-            await prisma.ow_projects_file.upsert({
-                where: {sha256: hash},
-                create: {
-                    sha256: hash,
-                    source: buffer.toString('base64'),
-                    create_userid: 1 // 系统用户
-                },
-                update: {} // 内容不变，无需更新
-            });
+            // Preserve the Base64 reader contract; new IDs hash the stored text.
+            const { sha256: hash } = await saveProjectFile(buffer.toString('base64'), { userId: 1 });
 
             // 更新配置
             await zcconfig.set('sitemap.current_file_hash', hash);

@@ -94,7 +94,7 @@ router.post('/send', async (req, res) => {
         const currentUserId = res.locals.userid !== 0 ? res.locals.userid : null;
 
         // 事务处理确保数据一致性
-        const result = await prisma.$transaction(async (tx) => {
+        await prisma.$transaction(async (tx) => {
             const deviceData = {
                 hostname,
                 screen,
@@ -127,7 +127,8 @@ router.post('/send', async (req, res) => {
                         fingerprint,
                         user_id: currentUserId,
                         ...deviceData,
-                    }
+                    },
+                    select: { id: true },
                 });
             } else {
                 // 未登录用户沿用匿名设备记录
@@ -135,7 +136,8 @@ router.post('/send', async (req, res) => {
                     where: {
                         fingerprint,
                         user_id: null
-                    }
+                    },
+                    select: { id: true },
                 });
 
                 if (device) {
@@ -144,7 +146,8 @@ router.post('/send', async (req, res) => {
                         data: {
                             ...deviceData,
                             last_seen: new Date(),
-                        }
+                        },
+                        select: { id: true },
                     });
                 } else {
                     device = await tx.ow_analytics_device.create({
@@ -152,13 +155,14 @@ router.post('/send', async (req, res) => {
                             fingerprint,
                             user_id: null,
                             ...deviceData,
-                        }
+                        },
+                        select: { id: true },
                     });
                 }
             }
 
             // 创建事件记录
-            const event = await tx.ow_analytics_event.create({
+            await tx.ow_analytics_event.create({
                 data: {
                     device_id: device.id,
                     user_id: currentUserId,
@@ -177,10 +181,9 @@ router.post('/send', async (req, res) => {
                     region: ipInfo.region,
                     city: ipInfo.city,
                     timezone: ipInfo.timezone,
-                }
+                },
+                select: { id: true },
             });
-
-            return {device, event};
         });
 
         res.json({success: true});

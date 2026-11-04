@@ -67,20 +67,6 @@ router.get("/getuserinfo", async function (req, res, next) {
             },
         });
 
-        var scratchcount = await prisma.ow_projects.count({
-            where: {
-                type: "scratch",
-                state: "public",
-                AND: [await visibleWhere('project', res.locals.userid)],
-            },
-        });
-        var pythoncount = await prisma.ow_projects.count({
-            where: {
-                type: "python",
-                state: "public",
-                AND: [await visibleWhere('project', res.locals.userid)],
-            },
-        });
         if (!user[0]) {
             logger.debug("用户不存在");
             return res.status(404).json({
@@ -89,6 +75,18 @@ router.get("/getuserinfo", async function (req, res, next) {
                 message: "找不到页面",
             });
         }
+        const projectCounts = await prisma.ow_projects.groupBy({
+            by: ['type'],
+            where: {
+                type: { in: ['scratch', 'python'] },
+                state: 'public',
+                AND: [await visibleWhere('project', res.locals.userid)],
+            },
+            _count: { _all: true },
+        });
+        const counts = new Map(projectCounts.map(row => [row.type, row._count._all]));
+        const scratchcount = counts.get('scratch') || 0;
+        const pythoncount = counts.get('python') || 0;
         res.send({
             status: "success",
             info: {
@@ -105,8 +103,14 @@ router.get("/info", async (req, res, next) => {
     try {
         const projectWhere = await visibleWhere('project', res.locals.userid);
         const userCount = await prisma.ow_users.count({ where: await visibleWhere('profile', res.locals.userid) });
-        const scratchCount = await prisma.ow_projects.count({ where: { type: 'scratch', AND: [projectWhere] } });
-        const pythonCount = await prisma.ow_projects.count({ where: { type: 'python', AND: [projectWhere] } });
+        const projectCounts = await prisma.ow_projects.groupBy({
+            by: ['type'],
+            where: { type: { in: ['scratch', 'python'] }, AND: [projectWhere] },
+            _count: { _all: true },
+        });
+        const counts = new Map(projectCounts.map(row => [row.type, row._count._all]));
+        const scratchCount = counts.get('scratch') || 0;
+        const pythonCount = counts.get('python') || 0;
 
         res.send({
             user: userCount,

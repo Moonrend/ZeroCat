@@ -214,7 +214,8 @@ const listAllInstallationRepos = async (token) => {
 const ensureProjectOwner = async (projectId, userId, res, action = 'read') => {
     const project = await prisma.ow_projects.findFirst({
         where: { id: Number(projectId) },
-        select: { id: true, authorid: true, default_branch: true, type: true, name: true, title: true, state: true },
+        select: { id: true, authorid: true, default_branch: true, type: true, name: true, title: true, state: true,
+            is_shadowbanned: true, shadowban_expires_at: true, deleted_at: true },
     });
     if (!project || !await canViewContent('project', project, userId)) {
         const error = new Error('项目不存在');

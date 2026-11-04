@@ -1,7 +1,8 @@
 import {prisma} from "../../services/prisma.js";
 import { createHash } from "crypto";
+import { hydrateProjectFile, saveProjectFile } from "../../services/projectFileStorage.js";
 import { projectSelectionFields, sanitizeProjectAuthors } from "../projects.js";
-import { visibleWhere, canViewContent, sanitizePublicUser, assertCanWrite } from "../../services/moderation/visibility.js";
+import { visibleWhere, canViewContent, sanitizePublicUser, sanitizeProfiles, assertCanWrite } from "../../services/moderation/visibility.js";
 import { authorizeResourceOperation, resourceAuthorizationContext } from "../../services/auth/resourceOperation.js";
 
 async function ensureBlogOwner(req, res, action) {
@@ -48,20 +49,18 @@ const withNameSuffix = (base, suffix) => {
 };
 
 const ensureUniqueProjectName = async (authorid, preferred) => {
-  let candidate = preferred;
-  let i = 1;
-  while (true) {
-    const existing = await prisma.ow_projects.findFirst({
-      where: {
-        authorid: Number(authorid),
-        name: candidate,
-      },
-      select: { id: true },
+  for (let offset = 0; ; offset += 32) {
+    const candidates = Array.from({ length: 32 }, (_, index) => {
+      const suffix = offset + index;
+      return suffix === 0 ? preferred : withNameSuffix(preferred, suffix);
     });
-
-    if (!existing) return candidate;
-    candidate = withNameSuffix(preferred, i);
-    i += 1;
+    const existing = await prisma.ow_projects.findMany({
+      where: { authorid: Number(authorid), name: { in: candidates } },
+      select: { name: true },
+    });
+    const usedNames = new Set(existing.map(project => project.name));
+    const available = candidates.find(candidate => !usedNames.has(candidate));
+    if (available) return available;
   }
 };
 
@@ -141,10 +140,11 @@ export const getPosts = async (req, res) => {
       return acc;
     }, {});
 
-    await Promise.all(posts.map(async p => {
-      p.blogConfig = configMap[String(p.id)] || {};
-      p.author = await sanitizePublicUser(p.author, res.locals.userid);
-    }));
+    const authors = await sanitizeProfiles(posts.map(post => post.author), res.locals.userid);
+    posts.forEach((post, index) => {
+      post.blogConfig = configMap[String(post.id)] || {};
+      post.author = authors[index];
+    });
 
     const total = await prisma.ow_projects.count({ where });
 
@@ -279,19 +279,23 @@ export const getPostDetail = async (req, res) => {
     }
 
     const defaultBranch = post.default_branch || "main";
-    const branch = await prisma.ow_projects_branch.findFirst({
-      where: { projectid: id, name: defaultBranch }
-    });
-    if (branch && branch.latest_commit_hash) {
-      const commit = await prisma.ow_projects_commits.findFirst({
-        where: { id: branch.latest_commit_hash }
-      });
-      if (commit && commit.commit_file) {
-        const fileContent = await prisma.ow_projects_file.findFirst({
-          where: { sha256: commit.commit_file }
-        });
-        post.file = fileContent;
-      }
+    const [content] = await prisma.$queryRaw`
+      SELECT c.commit_file, f.sha256, f.source, f.create_time, f.create_userid,
+             f.storage_provider, f.storage_bucket, f.storage_key,
+             f.content_size, f.content_sha256, f.content_type
+      FROM ow_projects_branch b
+      JOIN ow_projects_commits c ON c.id = b.latest_commit_hash
+      LEFT JOIN ow_projects_file f ON f.sha256 = c.commit_file
+      WHERE b.projectid = ${id} AND b.name = ${defaultBranch}
+      LIMIT 1
+    `;
+    if (content?.commit_file) {
+      const { commit_file, ...metadata } = content;
+      const file = metadata.sha256 === null ? null : await hydrateProjectFile(metadata);
+      post.file = file ? {
+        sha256: file.sha256, source: file.source,
+        create_time: file.create_time, create_userid: file.create_userid,
+      } : null;
     }
 
     post.blogConfig = configObj;
@@ -438,6 +442,11 @@ export const createPost = async (req, res) => {
     const normalizedState = normalizeArticleState(state);
     const normalizedCover = compactThumbnailRef(cover);
 
+    const emptySource = "";
+    const sourceSha256 = createHash("sha256").update(emptySource).digest("hex");
+    // Complete object storage I/O before opening the database transaction.
+    await saveProjectFile(emptySource, { userId, sha256: sourceSha256 });
+
     const project = await prisma.$transaction(async (tx) => {
       const created = await tx.ow_projects.create({
         data: {
@@ -450,19 +459,6 @@ export const createPost = async (req, res) => {
           license: "None",
           thumbnail: normalizedCover,
           default_branch: "main",
-        },
-      });
-
-      const emptySource = "";
-      const sourceSha256 = createHash("sha256").update(emptySource).digest("hex");
-
-      await tx.ow_projects_file.upsert({
-        where: { sha256: sourceSha256 },
-        update: {},
-        create: {
-          sha256: sourceSha256,
-          source: emptySource,
-          create_userid: userId,
         },
       });
 

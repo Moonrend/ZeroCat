@@ -92,19 +92,21 @@ export async function findProxyUserByActorUrl(actorUrl) {
         },
         take: 10,
     });
-    if (perUserMappings?.length) {
-        for (const row of perUserMappings) {
-            if (row.value === actorUrl && row.target_id !== '0') {
-                const userId = parseInt(row.target_id, 10);
-                if (!isNaN(userId)) {
-                    const user = await prisma.ow_users.findUnique({ where: { id: userId }, select: selectFields });
-                    if (user && user.type === REMOTE_USER_TYPE) {
-                        // 恢复全局索引
-                        await upsertTargetConfig(REMOTE_USER_TARGET_TYPE, '0', `actor_map:${actorUrl}`, String(userId));
-                        return user;
-                    }
-                }
-            }
+    const candidateIds = (perUserMappings || [])
+        .filter(row => row.value === actorUrl && row.target_id !== '0')
+        .map(row => parseInt(row.target_id, 10))
+        .filter(userId => !isNaN(userId));
+    if (candidateIds.length) {
+        const users = await prisma.ow_users.findMany({
+            where: { id: { in: [...new Set(candidateIds)] }, type: REMOTE_USER_TYPE },
+            select: selectFields,
+        });
+        const userById = new Map(users.map(user => [user.id, user]));
+        // Preserve mapping precedence if legacy rows point at different proxy users.
+        const userId = candidateIds.find(id => userById.has(id));
+        if (userId !== undefined) {
+            await upsertTargetConfig(REMOTE_USER_TARGET_TYPE, '0', `actor_map:${actorUrl}`, String(userId));
+            return userById.get(userId);
         }
     }
 

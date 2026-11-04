@@ -716,21 +716,14 @@ export function policyFromRows(rows) {
     };
 }
 
-// Authorization never trusts an allow cached before a revocation or an expiry.
-// useCache remains accepted by existing callers, but all decisions read current rows.
-export async function getUserPolicy(userId, { db = prisma, targetType = null, targetId = null } = {}) {
-    const normalizedUserId = normalizeUserId(userId);
-    if (!normalizedUserId) return { roles: [], allow: [], deny: [], sources: [], valid: false };
-    const type = targetType && String(targetType);
-    const id = targetId === null || targetId === undefined ? null : String(targetId);
-    try {
-        const rows = await db.$queryRaw`
+async function readUserPolicyRows(db, normalizedUserId, type, id, allTargets = false) {
+    return db.$queryRaw`
             WITH RECURSIVE assigned AS (
                 SELECT ur."id" AS assignment_id, ur."role_id", ur."target_type", ur."target_id", ur."expires_at", root."key" AS root_role_key,
                        root."key" = 'project_manager' AS restrict_project_delete
                 FROM "ow_user_roles" ur JOIN "ow_roles" root ON root."id" = ur."role_id"
                 WHERE ur."user_id" = ${normalizedUserId}
-                  AND (ur."target_type" = 'global' OR (ur."target_type" = ${type} AND ur."target_id" = ${id}))
+                  AND (ur."target_type" = 'global' OR (ur."target_type" = ${type} AND (${allTargets}::boolean OR ur."target_id" = ${id})))
                   AND (ur."expires_at" IS NULL OR ur."expires_at" > CURRENT_TIMESTAMP)
                 UNION
                 SELECT a.assignment_id, ri."parent_role_id", a."target_type", a."target_id", a."expires_at", a.root_role_key,
@@ -747,13 +740,64 @@ export async function getUserPolicy(userId, { db = prisma, targetType = null, ta
                    up."id", up."scope", up."effect", NULL::jsonb, NULL::varchar, false
             FROM "ow_user_permissions" up
             WHERE up."user_id" = ${normalizedUserId}
-              AND (up."target_type" = 'global' OR (up."target_type" = ${type} AND up."target_id" = ${id}))
+              AND (up."target_type" = 'global' OR (up."target_type" = ${type} AND (${allTargets}::boolean OR up."target_id" = ${id})))
               AND (up."expires_at" IS NULL OR up."expires_at" > CURRENT_TIMESTAMP)
         `;
-        return policyFromRows(rows);
+}
+
+// Authorization never trusts an allow cached before a revocation or an expiry.
+// useCache remains accepted by existing callers, but all decisions read current rows.
+export async function getUserPolicy(userId, { db = prisma, targetType = null, targetId = null } = {}) {
+    const normalizedUserId = normalizeUserId(userId);
+    if (!normalizedUserId) return { roles: [], allow: [], deny: [], sources: [], valid: false };
+    const type = targetType && String(targetType);
+    const id = targetId === null || targetId === undefined ? null : String(targetId);
+    try {
+        return policyFromRows(await readUserPolicyRows(db, normalizedUserId, type, id));
     } catch (error) {
         logger.error(`[policy] 读取用户角色策略失败 user=${normalizedUserId}: ${error.message}`);
         return { roles: [], allow: [], deny: [], sources: [], valid: false };
+    }
+}
+
+/** Read all candidate resource policies in one database snapshot, scoped to this call. */
+export async function getUserResourcePolicies(userId, targetType, { db = prisma } = {}) {
+    const normalizedUserId = normalizeUserId(userId);
+    const type = String(targetType || "");
+    if (!normalizedUserId || !type || type === "global") return new Map();
+    try {
+        const rows = await readUserPolicyRows(db, normalizedUserId, type, null, true);
+        const globalRows = [], scopedRows = new Map();
+        for (const row of rows) {
+            if (row.target_type === "global") globalRows.push(row);
+            else if (row.target_type === type) {
+                const id = String(row.target_id);
+                if (!scopedRows.has(id)) scopedRows.set(id, []);
+                scopedRows.get(id).push(row);
+            }
+        }
+        const globalPolicy = policyFromRows(globalRows);
+        const candidates = new Set(scopedRows.keys());
+        for (const source of globalPolicy.sources) {
+            const scope = parseScope(source.scope);
+            if (source.effect === "allow" && scope?.resource === type && scope.id !== null) candidates.add(scope.id);
+        }
+        const policies = new Map();
+        for (const candidate of candidates) {
+            // Match the canonical numeric resource IDs used by visibility queries.
+            const id = Number(candidate);
+            if (!Number.isSafeInteger(id) || id <= 0 || policies.has(id)) continue;
+            try {
+                policies.set(id, policyFromRows([...globalRows, ...(scopedRows.get(String(id)) || [])]));
+            } catch (error) {
+                // A malformed scoped grant must fail closed for that resource only.
+                logger.error(`[policy] 读取资源策略失败 user=${normalizedUserId} target=${type}:${id}: ${error.message}`);
+            }
+        }
+        return policies;
+    } catch (error) {
+        logger.error(`[policy] 批量读取用户资源策略失败 user=${normalizedUserId}: ${error.message}`);
+        return new Map();
     }
 }
 
@@ -863,6 +907,7 @@ export default {
     getUserRoleAssignments,
     replaceUserRoles,
     getUserPolicy,
+    getUserResourcePolicies,
     resourcePolicyAllowsScope,
     policyDeniesScope,
     policyFromRows,

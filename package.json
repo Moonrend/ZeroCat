@@ -28,6 +28,8 @@
     "lint:all": "turbo run lint",
     "typecheck:all": "turbo run typecheck",
     "test:dependencies": "node --test scripts/dependencies.test.js",
+    "test:storage": "node --experimental-test-module-mocks --test apps/api/src/services/objectStorage.test.js apps/api/src/services/projectFile*.test.js apps/api/src/services/gitSync/projectFileStorage.test.js apps/api/src/services/mirror40code/projectFileStorage.test.js apps/api/src/services/queue/workers/embeddingStorage.test.js apps/api/src/routes/router_search.storage.test.js apps/api/src/routes/router_project.moderation.test.js apps/api/src/routes/alternateAuthorization.test.js apps/api/src/controllers/queries.optimization.test.js scripts/project-file-migration.test.js",
+    "migrate:project-files": "pnpm --filter ./apps/api exec cross-env DOTENV_CONFIG_PATH=../../.env node --import tsx ../../scripts/migrate-project-files-to-s3.js",
     "test:permissions": "node scripts/test-token-permissions.js",
     "test:admin-users": "node --experimental-test-module-mocks --test apps/api/src/services/admin/*.test.js apps/api/src/services/auth/tokenService.test.js",
     "test:admin-users:db": "pnpm --filter ./apps/api exec node --import tsx --test src/services/admin/userManagement.integration.test.js",

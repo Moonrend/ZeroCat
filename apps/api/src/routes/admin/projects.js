@@ -1,5 +1,6 @@
 import {prisma} from '../../services/prisma.js';
 import express from 'express';
+import {summarizeGroups} from './groupedStats.js';
 import { softDeleteContent, restoreContent } from '../../services/moderation/lifecycle.js';
 import { assertCanWrite } from '../../services/moderation/restrictions.js';
 import { requireScope } from '../../middleware/scope.js';
@@ -211,16 +212,8 @@ router.post('/:id/restore', requireScope('admin:content:manage'), async (req, re
 router.get('/stats/overview', requireScope('admin:hidden_content:read'), async (req, res) => {
     try {
         const stats = await prisma.$transaction([
-            // Total projects count
-            prisma.ow_projects.count(),
-            // Projects by state
             prisma.ow_projects.groupBy({
-                by: ['state'],
-                _count: true
-            }),
-            // Projects by type
-            prisma.ow_projects.groupBy({
-                by: ['type'],
+                by: ['state', 'type'],
                 _count: true
             }),
             // Most viewed projects
@@ -247,12 +240,13 @@ router.get('/stats/overview', requireScope('admin:hidden_content:read'), async (
             })
         ]);
 
+        const summary = summarizeGroups(stats[0], ['state', 'type']);
         res.json({
-            totalProjects: stats[0],
-            projectsByState: stats[1],
-            projectsByType: stats[2],
-            mostViewed: stats[3],
-            mostStarred: stats[4]
+            totalProjects: summary.total,
+            projectsByState: summary.groups[0],
+            projectsByType: summary.groups[1],
+            mostViewed: stats[1],
+            mostStarred: stats[2]
         });
     } catch (error) {
         console.error('Error fetching project stats:', error);

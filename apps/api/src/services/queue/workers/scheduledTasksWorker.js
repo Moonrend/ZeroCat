@@ -105,24 +105,31 @@ taskHandlers.set('extension-sync', async (data, job) => {
         await job.log(`Found ${approvedIds.length} approved extensions`);
 
         let synced = 0;
-        for (const projectId of approvedIds) {
-            const project = await prisma.ow_projects.findUnique({
-                where: { id: projectId },
+        for (let offset = 0; offset < approvedIds.length; offset += 1000) {
+            const batch = approvedIds.slice(offset, offset + 1000);
+            const projects = await prisma.ow_projects.findMany({
+                where: { id: { in: batch } },
+                select: { id: true, default_branch: true },
             });
-            if (!project) continue;
+            const projectById = new Map(projects.map(project => [project.id, project]));
+            for (const projectId of batch) {
+                const project = projectById.get(projectId);
+                if (!project) continue;
 
-            await prisma.ow_scratch_extensions.upsert({
-                where: { projectid: projectId },
-                update: { status: 'verified', commit: 'latest' },
-                create: {
-                    projectid: projectId,
-                    status: 'verified',
-                    commit: 'latest',
-                    branch: project.default_branch || '',
-                    image: '',
-                },
-            });
-            synced++;
+                // Keep ordered upserts: an error still leaves only preceding entries synced.
+                await prisma.ow_scratch_extensions.upsert({
+                    where: { projectid: projectId },
+                    update: { status: 'verified', commit: 'latest' },
+                    create: {
+                        projectid: projectId,
+                        status: 'verified',
+                        commit: 'latest',
+                        branch: project.default_branch || '',
+                        image: '',
+                    },
+                });
+                synced++;
+            }
         }
 
         await job.log(`Synced ${synced} extensions`);

@@ -42,16 +42,17 @@ export const beginRegister = async (req, res) => {
             return res.status(200).json({status: "success", message: responseMessage});
         }
 
-        const contact = await prisma.ow_users_contacts.findFirst({
-            where: {contact_value: email, contact_type: "email"},
+        const existingUser = await prisma.ow_users.findFirst({
+            where: {
+                status: "active",
+                contacts: { some: { contact_value: email, contact_type: "email", verified: true } },
+            },
+            select: { id: true },
         });
-        const existingUser = contact
-            ? await prisma.ow_users.findUnique({where: {id: contact.user_id}})
-            : null;
 
         const frontendUrl = await zcconfig.get("urls.frontend");
 
-        if (existingUser && existingUser.status === "active" && contact.verified) {
+        if (existingUser) {
             // 已注册激活账户 → 发送登录魔术链接（保留 redirect）
             const magicLinkOptions = {templateType: "login"};
             if (redirect) {
@@ -251,25 +252,16 @@ export const retrievePassword = async (req, res) => {
             });
         }
 
-        // 查找已验证的邮箱联系方式
-        const contact = await prisma.ow_users_contacts.findFirst({
+        const user = await prisma.ow_users.findFirst({
             where: {
-                contact_value: email,
-                contact_type: "email",
-                verified: true,
+                status: "active",
+                contacts: { some: { contact_value: email, contact_type: "email", verified: true } },
             },
+            select: { id: true },
         });
 
         // 安全起见：无论邮箱是否存在，都返回相同的成功响应，避免账号枚举
-        if (!contact) {
-            return res.status(200).json({status: "success", message: responseMessage});
-        }
-
-        const user = await prisma.ow_users.findUnique({
-            where: {id: contact.user_id},
-        });
-
-        if (!user || user.status !== "active") {
+        if (!user) {
             return res.status(200).json({status: "success", message: responseMessage});
         }
 

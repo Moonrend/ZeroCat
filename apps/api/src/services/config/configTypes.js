@@ -144,6 +144,12 @@ export const CONFIG_TYPES = {
         required: true,
         description: "S3存储桶名称",
     },
+    "storage.projects.bucket": {
+        type: "string",
+        required: false,
+        default: "",
+        description: "项目正文专用私有S3桶，必须与公开素材s3.bucket不同；使用相同S3端点和凭据，禁止匿名读取。新文件写入前必须配置",
+    },
     "s3.staticurl": {
         type: "string",
         required: true,

@@ -192,14 +192,16 @@ class ScratchThumbnailMigrator {
     /**
      * Process a single thumbnail
      */
-    async processThumbnail(thumbnail) {
+    async processThumbnail(thumbnail, prefetchedProject) {
         try {
             const { key, projectId } = thumbnail;
 
             logger.info(`[缩略图迁移] 处理项目 ${projectId} 的缩略图...`);
 
             // Check if project exists
-            const project = await this.checkProjectExists(projectId);
+            const project = prefetchedProject === undefined
+                ? await this.checkProjectExists(projectId)
+                : prefetchedProject;
             if (!project) {
                 logger.warn(`[缩略图迁移] 项目不存在，跳过: ${projectId}`);
                 this.stats.projectNotFound++;
@@ -296,7 +298,19 @@ class ScratchThumbnailMigrator {
             const batchSize = 5; // Smaller batch size since image processing is intensive
             for (let i = 0; i < thumbnails.length; i += batchSize) {
                 const batch = thumbnails.slice(i, i + batchSize);
-                const promises = batch.map(thumbnail => this.processThumbnail(thumbnail));
+                let projects;
+                try {
+                    const rows = await prisma.ow_projects.findMany({
+                        where: { id: { in: [...new Set(batch.map(thumbnail => thumbnail.projectId))] } },
+                        select: { id: true, title: true, thumbnail: true },
+                    });
+                    projects = new Map(rows.map(project => [project.id, project]));
+                } catch (error) {
+                    // Preserve per-project error handling if a batch cannot be loaded.
+                    logger.warn('[缩略图迁移] 批量检查项目失败，逐个检查:', error);
+                }
+                const promises = batch.map(thumbnail => this.processThumbnail(thumbnail,
+                    projects ? projects.get(thumbnail.projectId) || null : undefined));
 
                 await Promise.all(promises);
 
@@ -370,10 +384,11 @@ Scratch Thumbnails Migration Tool
 }
 
 
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
     main().catch(error => {
         console.error('程序异常退出:', error);
         process.exit(1);
     });
-
+}
 
 export default ScratchThumbnailMigrator;

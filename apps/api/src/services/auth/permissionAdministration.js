@@ -125,18 +125,26 @@ export function createPermissionAdministration({ db, getPolicy = getUserPolicy, 
         const ids = [...new Set(parentIds.map(id))];
         const edges = await tx.ow_role_inheritance.findMany();
         const proposed = edges.filter((edge) => Number(edge.role_id) !== id(roleId));
-        for (const parentId of ids) {
-            await role(tx, parentId);
-            proposed.push({ role_id: id(roleId), parent_role_id: parentId });
+        if (ids.length) {
+            const parents = await tx.ow_roles.findMany({ where: { id: { in: ids } }, select: { id: true } });
+            const existing = new Set(parents.map(parent => parent.id));
+            for (const parentId of ids) {
+                if (!existing.has(parentId)) error(404, "ROLE_NOT_FOUND", "角色不存在");
+                proposed.push({ role_id: id(roleId), parent_role_id: parentId });
+            }
         }
         assertRoleInheritanceGraph(proposed);
         await tx.ow_role_inheritance.deleteMany({ where: { role_id: id(roleId) } });
         if (ids.length) await tx.ow_role_inheritance.createMany({ data: ids.map((parentId) => ({ role_id: id(roleId), parent_role_id: parentId })) });
     }
-    async function assertRoleGrantable(tx, actorPolicy, roleId, range = null) {
+    async function readRoleGraph(tx) {
         const roles = await tx.ow_roles.findMany({ include: { permissions: true } });
         const edges = await tx.ow_role_inheritance.findMany();
         assertRoleInheritanceGraph(edges);
+        return { roles, edges };
+    }
+    async function assertRoleGrantable(tx, actorPolicy, roleId, range = null, graph = null) {
+        const { roles, edges } = graph || await readRoleGraph(tx);
         const visited = new Set();
         const visit = (currentId) => {
             if (visited.has(currentId)) return;
@@ -275,10 +283,15 @@ export function createPermissionAdministration({ db, getPolicy = getUserPolicy, 
                 await otherUser(tx, actorId, userId);
                 const current = await tx.ow_user_roles.findMany({ where: { user_id: id(userId), target_type: "global" }, include: { role: true } });
                 const keys = [...new Set(roleKeys)];
-                for (const key of new Set([...keys, ...current.map((item) => item.role.key)])) {
-                    const record = await tx.ow_roles.findUnique({ where: { key } });
-                    if (!record) error(404, "ROLE_NOT_FOUND", "角色不存在");
-                    await assertRoleGrantable(tx, policy, record.id);
+                const checkedKeys = new Set([...keys, ...current.map((item) => item.role.key)]);
+                if (checkedKeys.size) {
+                    const graph = await readRoleGraph(tx);
+                    const rolesByKey = new Map(graph.roles.map(record => [record.key, record]));
+                    for (const key of checkedKeys) {
+                        const record = rolesByKey.get(key);
+                        if (!record) error(404, "ROLE_NOT_FOUND", "角色不存在");
+                        await assertRoleGrantable(tx, policy, record.id, null, graph);
+                    }
                 }
                 for (const assignment of current) if (!keys.includes(assignment.role.key)) await revokeRole(userId, assignment.role.key, { db: tx });
                 for (const key of keys) await assignRole(userId, key, { assignedBy: id(actorId), expiresAt, reason: input.reason || "admin-set-user-roles", db: tx });

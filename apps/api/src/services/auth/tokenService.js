@@ -831,13 +831,10 @@ export async function revokeTokensWhere(where, { db = prisma, invalidateCache = 
         }
 
         const narrowedWhere = { AND: [where, { revoked: false }] };
-        const tokens = await db.ow_tokens.findMany({
-            where: narrowedWhere,
-            select: { token_hash: true, refresh_token_hash: true },
-        });
-        const result = await db.ow_tokens.updateMany({
+        const tokens = await db.ow_tokens.updateManyAndReturn({
             where: narrowedWhere,
             data: { revoked: true, revoked_at: new Date() },
+            select: { token_hash: true, refresh_token_hash: true },
         });
 
         // DB-first：任何旧缓存命中仍会检查当前行，Redis 故障不能复活已吊销令牌。
@@ -845,7 +842,7 @@ export async function revokeTokensWhere(where, { db = prisma, invalidateCache = 
         const cacheResult = invalidateCache ? await invalidateTokenCaches(cacheKeys) : null;
         return {
             success: true,
-            count: result.count,
+            count: tokens.length,
             cacheKeys,
             cacheInvalidated: cacheResult?.success ?? false,
             ...(cacheResult && !cacheResult.success ? { warning: "令牌已吊销，但缓存清理失败" } : {}),

@@ -10,7 +10,7 @@ import * as embeddingService from "../services/embedding.js";
 import { getAnalytics } from "../services/analytics.js";
 import { getPostUrlPreview } from "../services/postPreview.js";
 import { toAvatarURL } from "../utils/avatarUrl.js";
-import { visibleWhere, sanitizeProfile } from "../services/moderation/visibility.js";
+import { visibleWhere, sanitizeProfiles } from "../services/moderation/visibility.js";
 import { assertCanWrite } from "../services/moderation/restrictions.js";
 import { softDeleteContent, restoreContent } from "../services/moderation/lifecycle.js";
 
@@ -311,24 +311,56 @@ function formatPost(raw) {
   };
 }
 
-export async function serializePost(raw, viewerId = null) {
+async function serializePosts(raws, viewerId = null) {
   await initStaticUrl();
-  const post = formatPost(raw);
-  if (!post) return null;
-  post.author = await sanitizeProfile(post.author, viewerId);
-  if (post.embed && post.embed.type !== "url") {
+  const posts = raws.map(formatPost);
+  const profiles = await sanitizeProfiles(posts.flatMap(post => post ? [post.author, ...post.mentions] : []), viewerId);
+  let offset = 0;
+  for (const post of posts) {
+    if (!post) continue;
+    post.author = profiles[offset++];
+    const end = offset + post.mentions.length;
+    post.mentions = profiles.slice(offset, end).filter(Boolean);
+    offset = end;
+  }
+  const embedGroups = new Map();
+  for (const post of posts) {
+    if (!post?.embed || post.embed.type === "url") continue;
     const embed = post.embed;
     const kind = { project: "project", article: "project", list: "list", user: "profile" }[embed.type];
     const model = { project: "ow_projects", list: "ow_projects_lists", profile: "ow_users" }[kind];
     const identity = embed.id ? { id: Number(embed.id) } : kind === "profile" && embed.username ? { username: String(embed.username) } : null;
-    const target = model && identity ? await prisma[model].findFirst({
-      where: { AND: [identity, await visibleWhere(kind, viewerId)] },
-      select: { id: true },
-    }) : null;
-    post.embed = target ? { type: embed.type, id: target.id } : null;
+    if (!model || !identity) { post.embed = null; continue; }
+    const key = identity.id !== undefined ? `id:${identity.id}` : `username:${identity.username}`;
+    if (!embedGroups.has(kind)) embedGroups.set(kind, { model, identities: new Map(), entries: [] });
+    const group = embedGroups.get(kind);
+    group.identities.set(key, identity);
+    group.entries.push({ post, key, type: embed.type });
   }
-  post.mentions = (await Promise.all(post.mentions.map((user) => sanitizeProfile(user, viewerId)))).filter(Boolean);
-  return post;
+  await Promise.all([...embedGroups].map(async ([kind, group]) => {
+    const identities = [...group.identities.values()];
+    const visibility = await visibleWhere(kind, viewerId);
+    const targets = new Map();
+    for (let start = 0; start < identities.length; start += 1000) {
+      const rows = await prisma[group.model].findMany({
+        where: { AND: [{ OR: identities.slice(start, start + 1000) }, visibility] },
+        select: { id: true, ...(kind === "profile" ? { username: true } : {}) },
+      });
+      for (const row of rows) {
+        targets.set(`id:${row.id}`, row.id);
+        if (kind === "profile") targets.set(`username:${row.username}`, row.id);
+      }
+    }
+    for (const { post, key, type } of group.entries) {
+      const id = targets.get(key);
+      post.embed = id === undefined ? null : { type, id };
+    }
+  }));
+  return posts;
+}
+
+export async function serializePost(raw, viewerId = null) {
+  return (await serializePosts([raw], viewerId))[0];
 }
 
 async function getPostViewCountMap(postIds) {
@@ -403,7 +435,7 @@ async function fetchReferencedPosts(ids, viewerId = null) {
     select: buildLeanSelect(),
   });
 
-  const formatted = await Promise.all(raws.map((raw) => serializePost(raw, viewerId)));
+  const formatted = await serializePosts(raws, viewerId);
   const enriched = await attachPostViewCounts(formatted, viewerId);
 
   const map = {};
@@ -455,21 +487,16 @@ async function addViewerContext(posts, viewerId) {
 }
 
 async function buildListResponse(rawPosts, limit, viewerId = null) {
-  let posts = await Promise.all(rawPosts.map((raw) => serializePost(raw, viewerId)));
-  posts = await addViewerContext(posts, viewerId);
-  posts = await attachPostViewCounts(posts, viewerId);
-
-  const refIds = collectReferencedIds(posts);
-  let referencedPosts = await fetchReferencedPosts(refIds, viewerId);
-
-  if (viewerId && Object.keys(referencedPosts).length > 0) {
-    const refPostsArray = Object.values(referencedPosts);
-    const enriched = await addViewerContext(refPostsArray, viewerId);
-    referencedPosts = {};
-    for (const p of enriched) {
-      referencedPosts[p.id] = p;
-    }
-  }
+  const refIds = collectReferencedIds(rawPosts.map(formatPost));
+  const referencedRaws = refIds.length ? await prisma.ow_posts.findMany({
+    where: await visiblePostWhere({ id: { in: refIds } }, viewerId),
+    select: buildLeanSelect(),
+  }) : [];
+  let enriched = await serializePosts([...rawPosts, ...referencedRaws], viewerId);
+  enriched = await addViewerContext(enriched, viewerId);
+  enriched = await attachPostViewCounts(enriched, viewerId);
+  const posts = enriched.slice(0, rawPosts.length);
+  const referencedPosts = Object.fromEntries(enriched.slice(rawPosts.length).map((post) => [post.id, post]));
 
   const hasMore = rawPosts.length === Number(limit);
   const nextCursor =
@@ -570,8 +597,8 @@ function normalizeCursor(cursor) {
   }
   return parsed;
 }
-async function notifyMentions(mentionedUsers, actorId, postId) {
-  const actorName = await getNotificationActorName(actorId);
+async function notifyMentions(mentionedUsers, actorId, postId, actor) {
+  const actorName = actor ? formatNotificationActorName(actor) : await getNotificationActorName(actorId);
 
   await Promise.all(
     mentionedUsers.map((user) =>
@@ -644,17 +671,13 @@ export async function createPost({ authorId, content, mediaIds = [], embed }) {
     });
 
     if (uniqueMediaIds.length > 0) {
-      await Promise.all(
-        uniqueMediaIds.map((assetId, index) =>
-          tx.ow_posts_media.create({
-            data: {
-              post_id: created.id,
-              asset_id: assetId,
-              order: index,
-            },
-          })
-        )
-      );
+      await tx.ow_posts_media.createMany({
+        data: uniqueMediaIds.map((assetId, index) => ({
+          post_id: created.id,
+          asset_id: assetId,
+          order: index,
+        })),
+      });
     }
 
     if (mentionedUserIds.length > 0) {
@@ -671,7 +694,7 @@ export async function createPost({ authorId, content, mediaIds = [], embed }) {
   });
 
   if (mentionedUsers.length > 0) {
-    await notifyMentions(mentionedUsers, authorId, post.id);
+    await notifyMentions(mentionedUsers, authorId, post.id, post.author);
   }
 
   const authorName = formatNotificationActorName(post.author);
@@ -769,17 +792,13 @@ export async function replyToPost({
     });
 
     if (uniqueMediaIds.length > 0) {
-      await Promise.all(
-        uniqueMediaIds.map((assetId, index) =>
-          tx.ow_posts_media.create({
-            data: {
-              post_id: created.id,
-              asset_id: assetId,
-              order: index,
-            },
-          })
-        )
-      );
+      await tx.ow_posts_media.createMany({
+        data: uniqueMediaIds.map((assetId, index) => ({
+          post_id: created.id,
+          asset_id: assetId,
+          order: index,
+        })),
+      });
     }
 
     if (mentionedUserIds.length > 0) {
@@ -796,7 +815,7 @@ export async function replyToPost({
   });
 
   if (target.author_id && target.author_id !== authorId) {
-    const actorName = await getNotificationActorName(authorId);
+    const actorName = formatNotificationActorName(post.author);
     const targetLabel = getPostTargetLabel(target);
     await createNotification({
       notificationType: "post_reply",
@@ -812,7 +831,7 @@ export async function replyToPost({
   }
 
   if (mentionedUsers.length > 0) {
-    await notifyMentions(mentionedUsers, authorId, post.id);
+    await notifyMentions(mentionedUsers, authorId, post.id, post.author);
   }
 
   queueManager.enqueueSocialPostSync(authorId, post.id, "reply").catch((error) => {
@@ -904,7 +923,7 @@ export async function retweetPost({ authorId, retweetPostId }) {
   });
 
   if (originalAuthorId && originalAuthorId !== authorId) {
-    const actorName = await getNotificationActorName(authorId);
+    const actorName = formatNotificationActorName(post.author);
     const targetLabel = getPostTargetLabel(target);
     await createNotification({
       notificationType: "post_retweet",
@@ -1033,17 +1052,13 @@ export async function quotePost({
     });
 
     if (uniqueMediaIds.length > 0) {
-      await Promise.all(
-        uniqueMediaIds.map((assetId, index) =>
-          tx.ow_posts_media.create({
-            data: {
-              post_id: created.id,
-              asset_id: assetId,
-              order: index,
-            },
-          })
-        )
-      );
+      await tx.ow_posts_media.createMany({
+        data: uniqueMediaIds.map((assetId, index) => ({
+          post_id: created.id,
+          asset_id: assetId,
+          order: index,
+        })),
+      });
     }
 
     if (mentionedUserIds.length > 0) {
@@ -1060,7 +1075,7 @@ export async function quotePost({
   });
 
   if (target.author_id && target.author_id !== authorId) {
-    const actorName = await getNotificationActorName(authorId);
+    const actorName = formatNotificationActorName(post.author);
     const targetLabel = getPostTargetLabel(target);
     await createNotification({
       notificationType: "post_quote",
@@ -1076,7 +1091,7 @@ export async function quotePost({
   }
 
   if (mentionedUsers.length > 0) {
-    await notifyMentions(mentionedUsers, authorId, post.id);
+    await notifyMentions(mentionedUsers, authorId, post.id, post.author);
   }
 
   queueManager.enqueueSocialPostSync(authorId, post.id, "quote").catch((error) => {
@@ -1327,12 +1342,13 @@ export async function getDeletedPosts({ userId, cursor, page, limit = 20 }) {
     total: await prisma.ow_posts.count({ where: ownerWhere }),
     page: safePage,
     limit: safeLimit,
-    posts: await Promise.all(posts.map(async (raw) => ({
-      ...await serializePost({ ...raw, is_deleted: false, deleted_at: null }, userId),
-      is_deleted: true,
-      deleted_at: raw.deleted_at,
-      can_restore: raw.deletion_source !== "admin" && raw.deletion_source !== "administrative",
-    }))),
+    posts: (await serializePosts(posts.map(raw => ({ ...raw, is_deleted: false, deleted_at: null })), userId))
+      .map((post, index) => ({
+        ...post,
+        is_deleted: true,
+        deleted_at: posts[index].deleted_at,
+        can_restore: posts[index].deletion_source !== "admin" && posts[index].deletion_source !== "administrative",
+      })),
     next_cursor: posts.length === safeLimit ? String(posts[posts.length - 1].id) : null,
     has_more: posts.length === safeLimit,
   };
@@ -1355,38 +1371,37 @@ export async function restorePost({ userId, postId, authorizationContext = {} })
  * @param {number} maxDepth - 最大遍历深度，防止无限循环
  * @returns {Promise<Array>} 祖先帖子列表，从最顶级到直接父贴的顺序
  */
-async function getAncestorChain(postId, viewerId = null, maxDepth = 50) {
-  const ancestors = [];
-  const visited = new Set();
-  let currentId = Number(postId);
-
-  while (currentId && ancestors.length < maxDepth) {
-    // 循环依赖检测
-    if (visited.has(currentId)) {
-      break;
-    }
-    visited.add(currentId);
-
-    const post = await prisma.ow_posts.findFirst({
-      where: await visiblePostWhere({ id: currentId }, viewerId),
+async function getAncestorChains(postIds, viewerId = null, maxDepth = 50) {
+  const starts = [...new Set(postIds.filter(Boolean).map(Number))];
+  const records = new Map();
+  let frontier = starts;
+  const visibility = starts.length ? await visibleWhere("post", viewerId) : null;
+  for (let depth = 0; depth < maxDepth && frontier.length; depth++) {
+    const rows = await prisma.ow_posts.findMany({
+      where: { id: { in: frontier }, AND: [visibility] },
       select: buildLeanSelect(),
     });
-
-    if (!post) break;
-
-    // 如果没有父帖，说明已经到顶级
-    if (!post.in_reply_to_id) {
-      // 将顶级帖子加入祖先链
-      ancestors.push(post);
-      break;
-    }
-
-    ancestors.push(post);
-    currentId = post.in_reply_to_id;
+    for (const id of frontier) records.set(id, null);
+    for (const row of rows) records.set(row.id, row);
+    frontier = [...new Set(rows.map(row => row.in_reply_to_id).filter(id => id && !records.has(id)))];
   }
+  return new Map(starts.map(start => {
+    const chain = [];
+    const visited = new Set();
+    let currentId = start;
+    while (currentId && chain.length < maxDepth && !visited.has(currentId)) {
+      visited.add(currentId);
+      const row = records.get(currentId);
+      if (!row) break;
+      chain.push(row);
+      currentId = row.in_reply_to_id;
+    }
+    return [start, chain.reverse()];
+  }));
+}
 
-  // 反转数组，使其从最顶级到当前帖子的父贴
-  return ancestors.reverse();
+async function getAncestorChain(postId, viewerId = null, maxDepth = 50) {
+  return (await getAncestorChains([postId], viewerId, maxDepth)).get(Number(postId)) || [];
 }
 
 /**
@@ -1437,7 +1452,7 @@ async function getRepliesWithClassification(postId, authorId, postLikeCount, vie
   const authorLikedIds = await getAuthorLikedReplyIds(postId, authorId, viewerId);
 
   // 格式化回复并添加viewer context
-  let formattedReplies = await Promise.all(directReplies.map((raw) => serializePost(raw, viewerId)));
+  let formattedReplies = await serializePosts(directReplies, viewerId);
   formattedReplies = await addViewerContext(formattedReplies, viewerId);
   formattedReplies = await attachPostViewCounts(formattedReplies, viewerId);
 
@@ -1488,16 +1503,14 @@ export async function getPostById(postId, viewerId = null) {
     const ancestorRaws = await getAncestorChain(raw.in_reply_to_id, viewerId);
     // 排除当前帖子本身（如果意外出现）
     const filteredAncestors = ancestorRaws.filter((a) => a.id !== raw.id);
-    ancestors = await Promise.all(filteredAncestors.map((raw) => serializePost(raw, viewerId)));
+    ancestors = await serializePosts(filteredAncestors, viewerId);
     ancestors = await addViewerContext(ancestors, viewerId);
     ancestors = await attachPostViewCounts(ancestors, viewerId);
   }
 
   // 获取分类后的回复
-  let { featured: featuredReplies, regular: regularReplies } =
+  const { featured: featuredReplies, regular: regularReplies } =
     await getRepliesWithClassification(raw.id, raw.author_id, post.stats.likes, viewerId);
-  featuredReplies = await attachPostViewCounts(featuredReplies, viewerId);
-  regularReplies = await attachPostViewCounts(regularReplies, viewerId);
 
   // 收集所有需要引用的帖子ID
   const allPosts = [post, ...ancestors, ...featuredReplies, ...regularReplies];
@@ -1689,34 +1702,7 @@ export async function getGlobalFeed({
     select: buildLeanSelect(),
   });
 
-  // 构建响应（使用 created_at 作为游标而非 id）
-  let posts = await Promise.all(rawPosts.map((raw) => serializePost(raw, viewerId)));
-  posts = await addViewerContext(posts, userId);
-  posts = await attachPostViewCounts(posts, viewerId);
-
-  const refIds = collectReferencedIds(posts);
-  let referencedPosts = await fetchReferencedPosts(refIds, viewerId);
-  if (userId && Object.keys(referencedPosts).length > 0) {
-    const refPostsArray = Object.values(referencedPosts);
-    const enriched = await addViewerContext(refPostsArray, userId);
-    referencedPosts = {};
-    for (const p of enriched) {
-      referencedPosts[p.id] = p;
-    }
-  }
-
-  const hasMore = rawPosts.length === safeLimit;
-  const nextCursor =
-    rawPosts.length > 0
-      ? rawPosts[rawPosts.length - 1].created_at.toISOString()
-      : null;
-
-  return {
-    posts,
-    includes: { posts: referencedPosts },
-    next_cursor: hasMore ? nextCursor : null,
-    has_more: hasMore,
-  };
+  return buildListResponse(rawPosts, safeLimit, viewerId);
 }
 
 export async function getThread(postId, { cursor, limit = 50, viewerId = null } = {}) {
@@ -1736,25 +1722,18 @@ export async function getThread(postId, { cursor, limit = 50, viewerId = null } 
 
   // 获取祖先链（如果是回复帖子）
   let ancestors = [];
+  let rootAuthorId = raw.author_id;
   if (raw.in_reply_to_id) {
     const ancestorRaws = await getAncestorChain(raw.in_reply_to_id, viewerId);
     const filteredAncestors = ancestorRaws.filter((a) => a.id !== raw.id);
-    ancestors = await Promise.all(filteredAncestors.map((raw) => serializePost(raw, viewerId)));
+    rootAuthorId = filteredAncestors[0]?.author_id || raw.author_id;
+    ancestors = await serializePosts(filteredAncestors, viewerId);
     ancestors = await addViewerContext(ancestors, viewerId);
     ancestors = await attachPostViewCounts(ancestors, viewerId);
   }
 
   // 确定线程根ID
   const threadRootId = raw.thread_root_id || raw.id;
-
-  // 找到真正的根帖（用于判断精选）
-  const actualRootId = ancestors.length > 0 ? ancestors[0].id : raw.id;
-  const actualRootLikeCount = ancestors.length > 0
-    ? (await prisma.ow_posts.findFirst({
-        where: { id: actualRootId },
-        select: { like_count: true, author_id: true }
-      }))
-    : { like_count: raw.like_count, author_id: raw.author_id };
 
   // 获取线程中的所有回复
   const repliesRaw = await prisma.ow_posts.findMany({
@@ -1768,13 +1747,12 @@ export async function getThread(postId, { cursor, limit = 50, viewerId = null } 
     select: buildLeanSelect(),
   });
 
-  let replies = await Promise.all(repliesRaw.map((raw) => serializePost(raw, viewerId)));
+  let replies = await serializePosts(repliesRaw, viewerId);
   replies = await addViewerContext(replies, viewerId);
   replies = await attachPostViewCounts(replies, viewerId);
 
   // 获取根帖作者点赞的所有回复ID
   const allReplyIds = repliesRaw.map((r) => r.id);
-  const rootAuthorId = actualRootLikeCount?.author_id || raw.author_id;
   const authorLikedIds = allReplyIds.length > 0
     ? new Set(
         (
@@ -2019,26 +1997,16 @@ export async function getPostAnalytics({ postId, viewerId }) {
     like_count: stats.likes,
   };
 
-  // 浏览分析（基于 ow_analytics_event）
-  const [viewCount, uniqueVisitors] = await Promise.all([
-    prisma.ow_analytics_event.count({
-      where: {
-        target_type: "post",
-        target_id: target.id,
-      },
-    }),
-    prisma.ow_analytics_event.findMany({
-      where: {
-        target_type: "post",
-        target_id: target.id,
-      },
-      distinct: ["device_id"],
-      select: { device_id: true },
-    }),
-  ]);
-
+  // Count distinct visitors in SQL, retaining the existing single null-device bucket.
+  const [visitors] = await prisma.$queryRaw`
+    SELECT COUNT(*) AS count FROM (
+      SELECT DISTINCT device_id FROM ow_analytics_event
+      WHERE target_type = 'post' AND target_id = ${target.id}
+    ) devices
+  `;
+  const viewCount = stats.views;
   result.view_count = viewCount;
-  result.visitor_count = uniqueVisitors.length;
+  result.visitor_count = Number(visitors.count);
   result.engagement_count =
     stats.replies + stats.retweets + stats.likes + stats.bookmarks;
   result.engagement_rate =
@@ -2226,43 +2194,21 @@ export async function getPostViewAnalytics({ postId, viewerId, startDate, endDat
  * 构建带祖先链的回帖列表响应
  */
 async function buildRepliesListResponse(rawPosts, limit, viewerId = null) {
-  let posts = await Promise.all(rawPosts.map((raw) => serializePost(raw, viewerId)));
-  posts = await addViewerContext(posts, viewerId);
-  posts = await attachPostViewCounts(posts, viewerId);
-
-  // 为每个回帖获取祖先链
-  const postsWithAncestors = await Promise.all(
-    posts.map(async (post, index) => {
-      const raw = rawPosts[index];
-      let ancestors = [];
-
-      if (raw.in_reply_to_id) {
-        const ancestorRaws = await getAncestorChain(raw.in_reply_to_id, viewerId);
-        const filteredAncestors = ancestorRaws.filter((a) => a.id !== raw.id);
-        ancestors = await Promise.all(filteredAncestors.map((raw) => serializePost(raw, viewerId)));
-        ancestors = await addViewerContext(ancestors, viewerId);
-        ancestors = await attachPostViewCounts(ancestors, viewerId);
-      }
-
-      return { post, ancestors };
-    })
-  );
-
-  // 收集所有引用的帖子ID
-  const allPosts = postsWithAncestors.flatMap((p) => [p.post, ...p.ancestors]);
-  const refIds = collectReferencedIds(allPosts);
-  const existingIds = new Set(allPosts.map((p) => p.id));
-  const filteredRefIds = refIds.filter((id) => !existingIds.has(id));
-  let referencedPosts = await fetchReferencedPosts(filteredRefIds, viewerId);
-
-  if (viewerId && Object.keys(referencedPosts).length > 0) {
-    const refPostsArray = Object.values(referencedPosts);
-    const enriched = await addViewerContext(refPostsArray, viewerId);
-    referencedPosts = {};
-    for (const p of enriched) {
-      referencedPosts[p.id] = p;
+  const chains = await getAncestorChains(rawPosts.map(post => post.in_reply_to_id), viewerId);
+  const uniqueRaws = new Map(rawPosts.map(post => [post.id, post]));
+  for (const chain of chains.values()) {
+    for (const post of chain) {
+      if (!uniqueRaws.has(post.id)) uniqueRaws.set(post.id, post);
     }
   }
+  const enriched = await buildListResponse([...uniqueRaws.values()], Infinity, viewerId);
+  const postMap = new Map(enriched.posts.map(post => [post.id, post]));
+  const postsWithAncestors = rawPosts.map(raw => ({
+    post: postMap.get(raw.id),
+    ancestors: (chains.get(raw.in_reply_to_id) || []).filter(ancestor => ancestor.id !== raw.id)
+      .map(ancestor => postMap.get(ancestor.id)),
+  }));
+  const referencedPosts = enriched.includes.posts;
 
   const hasMore = rawPosts.length === Number(limit);
   const nextCursor =
@@ -2373,21 +2319,7 @@ export async function getUserLikedPosts({ userId, cursor, limit = 20, viewerId }
   });
 
   const rawPosts = likes.map((l) => l.post).filter(Boolean);
-  let posts = await Promise.all(rawPosts.map((raw) => serializePost(raw, viewerId)));
-  posts = await addViewerContext(posts, viewerId);
-  posts = await attachPostViewCounts(posts, viewerId);
-
-  const refIds = collectReferencedIds(posts);
-  let referencedPosts = await fetchReferencedPosts(refIds, viewerId);
-
-  if (Object.keys(referencedPosts).length > 0) {
-    const refPostsArray = Object.values(referencedPosts);
-    const enriched = await addViewerContext(refPostsArray, viewerId);
-    referencedPosts = {};
-    for (const p of enriched) {
-      referencedPosts[p.id] = p;
-    }
-  }
+  const { posts, includes: { posts: referencedPosts } } = await buildListResponse(rawPosts, Infinity, viewerId);
 
   const hasMore = likes.length === Number(limit);
   const nextCursor = likes.length > 0 ? String(likes[likes.length - 1].id) : null;
@@ -2430,21 +2362,7 @@ export async function getUserBookmarks({ userId, cursor, limit = 20, viewerId })
   });
 
   const rawPosts = bookmarks.map((b) => b.post).filter(Boolean);
-  let posts = await Promise.all(rawPosts.map((raw) => serializePost(raw, viewerId)));
-  posts = await addViewerContext(posts, viewerId);
-  posts = await attachPostViewCounts(posts, viewerId);
-
-  const refIds = collectReferencedIds(posts);
-  let referencedPosts = await fetchReferencedPosts(refIds, viewerId);
-
-  if (Object.keys(referencedPosts).length > 0) {
-    const refPostsArray = Object.values(referencedPosts);
-    const enriched = await addViewerContext(refPostsArray, viewerId);
-    referencedPosts = {};
-    for (const p of enriched) {
-      referencedPosts[p.id] = p;
-    }
-  }
+  const { posts, includes: { posts: referencedPosts } } = await buildListResponse(rawPosts, Infinity, viewerId);
 
   const hasMore = bookmarks.length === Number(limit);
   const nextCursor = bookmarks.length > 0 ? String(bookmarks[bookmarks.length - 1].id) : null;
@@ -2497,20 +2415,7 @@ export async function getRecommendedFeed({
     .map(id => postMap.get(id))
     .filter(Boolean);
 
-  let posts = await Promise.all(orderedRaw.map((raw) => serializePost(raw, viewerId)));
-  posts = await addViewerContext(posts, userId);
-  posts = await attachPostViewCounts(posts, viewerId);
-
-  const refIds = collectReferencedIds(posts);
-  let referencedPosts = await fetchReferencedPosts(refIds, viewerId);
-  if (userId && Object.keys(referencedPosts).length > 0) {
-    const refPostsArray = Object.values(referencedPosts);
-    const enriched = await addViewerContext(refPostsArray, userId);
-    referencedPosts = {};
-    for (const p of enriched) {
-      referencedPosts[p.id] = p;
-    }
-  }
+  const { posts, includes: { posts: referencedPosts } } = await buildListResponse(orderedRaw, Infinity, viewerId);
 
   const hasMore = postIds.length === limit;
 
@@ -2601,18 +2506,16 @@ export async function getMixedRecommendFeed({
   const orderedUsers = userIds.map(id => userMap.get(Number(id))).filter(Boolean);
 
   // 格式化帖子
-  let posts = await Promise.all(orderedPosts.map((raw) => serializePost(raw, viewerId)));
+  let posts = await serializePosts(orderedPosts, viewerId);
   posts = await addViewerContext(posts, userId);
   posts = await attachPostViewCounts(posts, viewerId);
 
   // 为作品附加头像 URL
-  const projectsWithAvatar = await Promise.all(orderedProjects.map(async (p) => ({
-    ...p,
-    author: await sanitizeProfile(p.author ? {
-      ...p.author,
-      avatarURL: buildAuthorAvatarUrl(p.author.avatar),
-    } : null, viewerId),
-  })));
+  const projectAuthors = await sanitizeProfiles(orderedProjects.map(project => project.author ? {
+    ...project.author,
+    avatarURL: buildAuthorAvatarUrl(project.author.avatar),
+  } : null), viewerId);
+  const projectsWithAvatar = orderedProjects.map((project, index) => ({ ...project, author: projectAuthors[index] }));
 
   // 为用户附加头像 URL
   const usersWithAvatar = await Promise.all(orderedUsers.map(async (u) => ({
@@ -2776,7 +2679,7 @@ export async function getSimilarPosts({ postId, limit = 10, viewerId = null, min
   // 截取到 safeLimit
   const trimmed = rawPosts.slice(0, safeLimit);
 
-  let posts = await Promise.all(trimmed.map((raw) => serializePost(raw, viewerId)));
+  let posts = await serializePosts(trimmed, viewerId);
   posts = await addViewerContext(posts, viewerId);
   posts = await attachPostViewCounts(posts, viewerId);
 

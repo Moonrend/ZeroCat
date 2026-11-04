@@ -668,43 +668,19 @@ router.post("/:id/reject", async (req, res) => {
  */
 router.get("/stats/overview", async (req, res) => {
     try {
-        const [
-            totalExtensions,
-            developingExtensions,
-            pendingExtensions,
-            verifiedExtensions,
-            rejectedExtensions,
-            scratchCompatibleExtensions,
-        ] = await Promise.all([
-            prisma.ow_scratch_extensions.count(),
-            prisma.ow_scratch_extensions.count({
-                where: {status: "developing"},
-            }),
-            prisma.ow_scratch_extensions.count({
-                where: {status: "pending"},
-            }),
-            prisma.ow_scratch_extensions.count({
-                where: {status: "verified"},
-            }),
-            prisma.ow_scratch_extensions.count({
-                where: {status: "rejected"},
-            }),
-            prisma.ow_scratch_extensions.count({
-                where: {scratchCompatible: true},
-            }),
-        ]);
-
-        res.json({
-            status: "success",
-            data: {
-                total: totalExtensions,
-                developing: developingExtensions,
-                pending: pendingExtensions,
-                verified: verifiedExtensions,
-                rejected: rejectedExtensions,
-                scratchCompatible: scratchCompatibleExtensions,
-            },
+        const groups = await prisma.ow_scratch_extensions.groupBy({
+            by: ["status", "scratchCompatible"],
+            _count: true,
         });
+        const data = { total: 0, developing: 0, pending: 0, verified: 0, rejected: 0, scratchCompatible: 0 };
+        const statuses = new Set(["developing", "pending", "verified", "rejected"]);
+        for (const group of groups) {
+            data.total += group._count;
+            if (statuses.has(group.status)) data[group.status] += group._count;
+            if (group.scratchCompatible === true) data.scratchCompatible += group._count;
+        }
+
+        res.json({ status: "success", data });
     } catch (error) {
         logger.error("Error fetching extension stats:", error);
         res.status(500).json({error: "Internal server error"});

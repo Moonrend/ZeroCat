@@ -7,11 +7,21 @@ class ConfigService extends EventEmitter {
         super();
         this._cache = new Map();
         this._initialized = false;
+        this._initializationPromise = null;
     }
 
     async init() {
         if (this._initialized) return;
+        if (this._initializationPromise) return this._initializationPromise;
+        this._initializationPromise = this._loadConfigs();
+        try {
+            return await this._initializationPromise;
+        } finally {
+            this._initializationPromise = null;
+        }
+    }
 
+    async _loadConfigs() {
         try {
             // 从数据库加载所有配置
             const dbConfigs = await prisma.ow_config.findMany();

@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { prisma } from "./prisma.js";
-import logger from "./logger.js";
+import { saveProjectFile } from "./projectFileStorage.js";
 
 export async function createBranchIfNotExists(projectid, branch, userid) {
   let branchRecord = await prisma.ow_projects_branch.findFirst({
@@ -50,18 +50,8 @@ export async function getLatestCommit(projectid, branch = "main") {
 
 export async function writeSourceFile(source, userid) {
   const normalized = typeof source === "string" ? source : String(source ?? "");
-  const sha256 = createHash("sha256").update(normalized).digest("hex");
-  try {
-    await prisma.ow_projects_file.create({
-      data: { sha256, source: normalized, create_userid: userid },
-    });
-  } catch (err) {
-    if (err?.code !== "P2002") {
-      logger.error("[commitService] writeSourceFile failed:", err);
-      throw err;
-    }
-  }
-  return sha256;
+  const file = await saveProjectFile(normalized, { userId: userid });
+  return file.sha256;
 }
 
 export async function createCommit({

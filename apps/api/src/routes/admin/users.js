@@ -1,4 +1,5 @@
 import {Router} from "express";
+import {summarizeGroups} from "./groupedStats.js";
 import {prisma} from "../../services/prisma.js";
 import {validateUsername} from "../../services/global.js";
 import logger from "../../services/logger.js";
@@ -829,16 +830,8 @@ router.post("/:id/status", async (req, res) => {
 router.get("/stats/overview", async (req, res) => {
     try {
         const stats = await prisma.$transaction([
-            // Total users
-            prisma.ow_users.count(),
-            // Users by status
             prisma.ow_users.groupBy({
-                by: ["status"],
-                _count: true,
-            }),
-            // Users by type
-            prisma.ow_users.groupBy({
-                by: ["type"],
+                by: ["status", "type"],
                 _count: true,
             }),
             // New users in last 7 days
@@ -851,11 +844,12 @@ router.get("/stats/overview", async (req, res) => {
             }),
         ]);
 
+        const summary = summarizeGroups(stats[0], ["status", "type"]);
         res.json({
-            totalUsers: stats[0],
-            usersByStatus: stats[1],
-            usersByType: stats[2],
-            newUsersLast7Days: stats[3],
+            totalUsers: summary.total,
+            usersByStatus: summary.groups[0],
+            usersByType: summary.groups[1],
+            newUsersLast7Days: stats[1],
         });
     } catch (error) {
         console.error("Error fetching user stats:", error);

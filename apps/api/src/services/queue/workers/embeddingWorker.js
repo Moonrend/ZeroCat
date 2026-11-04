@@ -16,6 +16,7 @@ import { QUEUE_NAMES } from '../queues.js';
 import zcconfig from '../../config/zcconfig.js';
 import logger from '../../logger.js';
 import { prisma } from '../../prisma.js';
+import { hydrateProjectFile } from '../../projectFileStorage.js';
 import embeddingService from '../../embedding.js';
 import gorseService from '../../gorse.js';
 import { visibleWhere, canViewContent } from '../../moderation/visibility.js';
@@ -186,7 +187,9 @@ function buildAssetUrl(staticBase, value) {
 
 async function fetchProjectLatestSource(projectId) {
     const rows = await prisma.$queryRawUnsafe(`
-        SELECT pf.source
+        SELECT pf.sha256, pf.source, pf.create_time, pf.create_userid,
+               pf.storage_provider, pf.storage_bucket, pf.storage_key,
+               pf.content_size, pf.content_sha256, pf.content_type
         FROM ow_projects_commits pc
         JOIN ow_projects_file pf ON pf.sha256 = pc.commit_file
         WHERE pc.project_id = $1
@@ -194,7 +197,8 @@ async function fetchProjectLatestSource(projectId) {
         LIMIT 1
     `, Number(projectId));
 
-    return String(rows?.[0]?.source || '');
+    const file = rows?.[0] ? await hydrateProjectFile(rows[0]) : null;
+    return String(file?.source || '');
 }
 
 function parseScratchProjectJson(source) {
@@ -403,15 +407,7 @@ function calcDecayFactor(timestamp, halfLifeDays = 30) {
 }
 
 async function fetchLatestProjectSource(projectId) {
-    const rows = await prisma.$queryRawUnsafe(`
-        SELECT pf.source
-        FROM ow_projects_commits pc
-        JOIN ow_projects_file pf ON pf.sha256 = pc.commit_file
-        WHERE pc.project_id = $1
-        ORDER BY pc.commit_date DESC
-        LIMIT 1
-    `, Number(projectId));
-    return String(rows?.[0]?.source || '');
+    return fetchProjectLatestSource(projectId);
 }
 
 async function fetchUserReadmeLikeSource(user, authoredProjects) {

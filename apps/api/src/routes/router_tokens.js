@@ -22,7 +22,7 @@ import {
     userCanAccessResourceScope,
     validateUserGrantableScopes,
 } from "../services/auth/scopes.js";
-import { getUserPolicy, userSatisfiesPolicy } from "../services/auth/policyEngine.js";
+import { getUserPolicy, policyAllowsScope, userSatisfiesPolicy } from "../services/auth/policyEngine.js";
 import { prisma } from "../services/prisma.js";
 
 const router = Router();
@@ -35,6 +35,9 @@ router.use(needLogin);
  * GET /tokens/scopes
  */
 router.get("/scopes", async (req, res) => {
+    // Catalog entries normally describe type-wide capabilities. Evaluate each against
+    // the same live policy without normalizing away narrower entries in the catalog.
+    const policy = await getUserPolicy(res.locals.userid);
     const catalogChecks = await Promise.all(
         SCOPE_CATALOG.map(async (item) => {
             if (!tokenContextCanGrantScopes(
@@ -44,6 +47,11 @@ router.get("/scopes", async (req, res) => {
             )) {
                 return null;
             }
+            const parsed = parseScope(item.name);
+            if (parsed && (parsed.wildcard || parsed.id === null || parsed.resource === 'admin')) {
+                return policyAllowsScope(policy, item.name) ? item : null;
+            }
+            // Keep the resource-boundary check if a concrete instance is added to the catalog.
             const grantCheck = await validateUserGrantableScopes(res.locals.userid, [item.name]);
             return grantCheck.allowed ? item : null;
         })
@@ -235,10 +243,13 @@ router.post("/debug/evaluate", async (req, res) => {
         }
 
         const tokenScopes = normalizeScopes(res.locals.scopes || []);
+        const policy = await getUserPolicy(res.locals.userid);
         const results = await Promise.all(requiredScopes.map(async (scopeName) => {
             const parsed = parseScope(scopeName);
             const tokenAllowed = scopeSatisfies(tokenScopes, scopeName);
-            const policyAllowed = await userSatisfiesPolicy(res.locals.userid, scopeName);
+            const policyAllowed = parsed?.id && parsed.resource !== 'admin'
+                ? await userSatisfiesPolicy(res.locals.userid, scopeName)
+                : policyAllowsScope(policy, scopeName);
             const resourceAllowed = parsed?.id
                 ? await userCanAccessResourceScope(res.locals.userid, scopeName)
                 : true;

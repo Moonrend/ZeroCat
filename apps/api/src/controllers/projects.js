@@ -1,9 +1,9 @@
 import logger from "../services/logger.js";
 import {prisma} from "../services/prisma.js";
 
-import {createHash} from "crypto";
+import { readProjectFile, saveProjectFile } from "../services/projectFileStorage.js";
 import {getUsersByList} from "./users.js";
-import { visibleWhere, sanitizeProfile } from "../services/moderation/visibility.js";
+import { visibleWhere, sanitizeProfiles } from "../services/moderation/visibility.js";
 
 async function getProjectsByList(list, userid = null) {
     const select = projectSelectionFields();
@@ -26,23 +26,24 @@ async function getProjectById(projectId, userid = null) {
 }
 
 async function sanitizeProjectAuthors(projects, viewerId = null) {
-    return Promise.all(projects.map(async (project) => {
-        let fork = project.fork;
-        if (fork) {
-            const source = await prisma.ow_projects.findFirst({
-                where: { AND: [{ id: Number(fork) }, await visibleWhere("project", viewerId)] },
-                select: { id: true },
-            });
-            if (!source) fork = null;
-        }
-        return { ...project, ...(project.fork ? { fork } : {}), author: await sanitizeProfile(project.author, viewerId) };
+    const forkIds = [...new Set(projects.filter((project) => project.fork).map((project) => Number(project.fork)))];
+    const visibleForks = forkIds.length ? await prisma.ow_projects.findMany({
+        where: { AND: [{ id: { in: forkIds } }, await visibleWhere("project", viewerId)] },
+        select: { id: true },
+    }) : [];
+    const visibleForkIds = new Set(visibleForks.map((project) => project.id));
+    const authors = await sanitizeProfiles(projects.map(project => project.author), viewerId);
+    return projects.map((project, index) => ({
+        ...project,
+        ...(project.fork ? { fork: visibleForkIds.has(Number(project.fork)) ? project.fork : null } : {}),
+        author: authors[index],
     }));
 }
 
 async function getProjectsAndUsersByProjectsList(list, userid = null) {
     const projects = await getProjectsByList(list, userid);
     const userslist = [...new Set(projects.map((project) => project.authorid))];
-    const users = (await Promise.all((await getUsersByList(userslist, userid)).map((user) => sanitizeProfile(user, userid)))).filter(Boolean);
+    const users = (await sanitizeProfiles(await getUsersByList(userslist, userid), userid)).filter(Boolean);
     return {projects, users};
 }
 
@@ -79,23 +80,20 @@ async function handleTagsChange(projectId, tags) {
     tags = extractProjectTags(tags);
 
     const tagNames = new Set(tags);
-    await Promise.all(
-        existingTags.map(async (tag) => {
-            if (!tagNames.has(tag.name)) {
-                await prisma.ow_projects_tags.delete({where: {id: tag.id}});
-            } else {
-                tagNames.delete(tag.name);
-            }
-        })
-    );
-
-    await Promise.all(
-        [...tagNames].map(async (name) => {
-            await prisma.ow_projects_tags.create({
-                data: {projectid: projectId, name},
-            });
-        })
-    );
+    const deleteIds = [];
+    for (const tag of existingTags) {
+        if (!tagNames.delete(tag.name)) deleteIds.push(tag.id);
+    }
+    const writes = [];
+    if (deleteIds.length) {
+        writes.push(prisma.ow_projects_tags.deleteMany({ where: { id: { in: deleteIds } } }));
+    }
+    if (tagNames.size) {
+        writes.push(prisma.ow_projects_tags.createMany({
+            data: [...tagNames].map((name) => ({ projectid: projectId, name })),
+        }));
+    }
+    if (writes.length) await prisma.$transaction(writes);
 }
 
 /**
@@ -103,13 +101,10 @@ async function handleTagsChange(projectId, tags) {
  * @param {string | Object} source - Project source
  * @returns {Promise<string>} - SHA256 of the source
  */
-function setProjectFile(source) {
+async function setProjectFile(source) {
     const sourcedata = isJson(source) ? JSON.stringify(source) : source;
-    const sha256 = createHash("sha256").update(sourcedata).digest("hex");
-    prisma.ow_projects_file
-        .create({data: {sha256, source: sourcedata}})
-        .catch(logger.error);
-    return sha256;
+    const file = await saveProjectFile(sourcedata);
+    return file.sha256;
 }
 
 /**
@@ -118,10 +113,8 @@ function setProjectFile(source) {
  * @returns {Promise<{ source: string }>} - Project source
  */
 async function getProjectFile(sha256) {
-    return prisma.ow_projects_file.findFirst({
-        where: {sha256},
-        select: {source: true},
-    });
+    const file = await readProjectFile(sha256);
+    return file ? { source: file.source } : null;
 }
 
 /**

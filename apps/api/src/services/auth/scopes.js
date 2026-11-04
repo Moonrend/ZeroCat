@@ -940,25 +940,23 @@ export function normalizeScopes(scopes) {
  */
 export async function syncScopeCatalog() {
     try {
-        const { prisma } = await import("../prisma.js");
-        for (const item of SCOPE_CATALOG) {
-            if (item.name === "*") continue;
-            await prisma.ow_oauth_scopes.upsert({
-                where: { name: item.name },
-                update: {
-                    description: item.description,
-                    category: item.category,
-                    risk_level: item.risk_level,
-                },
-                create: {
-                    name: item.name,
-                    description: item.description,
-                    category: item.category,
-                    risk_level: item.risk_level,
-                    is_default: item.name === "user:read",
-                },
-            });
-        }
+        const [{ prisma }, { Prisma }] = await Promise.all([
+            import("../prisma.js"), import("../../../generated/prisma/client.ts"),
+        ]);
+        const values = SCOPE_CATALOG.filter(item => item.name !== "*").map(item => Prisma.sql`
+            (${item.name}, ${item.description}, ${item.category}, ${item.risk_level}, ${item.name === "user:read"}, CURRENT_TIMESTAMP)
+        `);
+        if (values.length) await prisma.$executeRaw(Prisma.sql`
+            INSERT INTO "oauth_scopes" ("name", "description", "category", "risk_level", "is_default", "updated_at")
+            VALUES ${Prisma.join(values)}
+            ON CONFLICT ("name") DO UPDATE SET
+                "description" = EXCLUDED."description",
+                "category" = EXCLUDED."category",
+                "risk_level" = EXCLUDED."risk_level",
+                "updated_at" = CURRENT_TIMESTAMP
+            WHERE ("oauth_scopes"."description", "oauth_scopes"."category", "oauth_scopes"."risk_level")
+                IS DISTINCT FROM (EXCLUDED."description", EXCLUDED."category", EXCLUDED."risk_level")
+        `);
         logger.info(`[scopes] 已同步 ${SCOPE_CATALOG.length - 1} 个 scope 到目录`);
     } catch (error) {
         logger.error(`[scopes] 同步 scope 目录失败: ${error.message}`);

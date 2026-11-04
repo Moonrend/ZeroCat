@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import { beforeEach, mock, test } from 'node:test';
+import { createHash } from 'node:crypto';
 
 const url = path => new URL(path, import.meta.url).href;
 const state = {};
 const logger = { error() {}, warn() {}, info() {}, debug() {} };
 const prisma = {
+    async $queryRaw(parts, ...values) {
+        state.contentQueries.push({ sql: parts.join('?'), values });
+        return state.contentRows;
+    },
     ow_projects_lists: {
         async findUnique() { return state.list; },
         async findFirst(query) {
@@ -32,6 +37,7 @@ const prisma = {
     ow_comment_service: {
         async findUnique() { return state.comment; }, async findFirst() { return state.comment; },
         async findMany(query) { state.commentQueries.push(query); return []; }, async count() { return 0; },
+        async groupBy() { return []; },
         async update(query) { state.writes.push(query); return { ...state.comment, ...query.data }; },
         async deleteMany(query) { state.writes.push(query); return { count: 1 }; },
     },
@@ -53,6 +59,7 @@ mock.module(url('../moderation/visibility.js'), { namedExports: {
     async visibleSql() { return { text: 'TRUE', values: [] }; },
     async canViewContent(kind, row, actorId, options) { state.visibility.push({ kind, actorId, options }); return !state.hidden; },
     async sanitizePublicUser(user) { return user; },
+    async sanitizeProfiles(users) { return users; },
     async assertCanWrite(userId, category, action) {
         state.guards.push({ userId, category, action });
         if (state.readonly === `${userId}:${category}`) throw Object.assign(new Error('readonly'), { statusCode: 403, code: 'ACCOUNT_READ_ONLY' });
@@ -62,6 +69,13 @@ mock.module(url('../cachekv.js'), { namedExports: {
     async get(userId, key) { state.storage.push({ op: 'get', userId, key }); return { value: { content: 'draft', baseCommitId: 'base' } }; },
     async set(userId, key, value) { state.storage.push({ op: 'set', userId, key }); return { value, updated_at: 'now' }; },
     async remove(userId, key) { state.storage.push({ op: 'remove', userId, key }); return true; },
+} });
+mock.module(url('../projectFileStorage.js'), { namedExports: {
+    async hydrateProjectFile(row) {
+        state.hydratedFiles.push(row);
+        return { ...row, source: row.storage_provider ? 'hydrated source' : row.source };
+    },
+    async saveProjectFile(source) { return { sha256: createHash('sha256').update(source).digest('hex') }; },
 } });
 mock.module(url('../commitService.js'), { namedExports: {
     async getLatestCommit() { return null; },
@@ -97,7 +111,8 @@ beforeEach(() => Object.assign(state, {
     space: { id: 3, cuid: 'space-cuid', owner_id: 9, status: 'active' },
     comment: { id: 11, space_id: 3, account_user_id: 9, status: 'waiting', comment: 'text' },
     authorizations: [], listQueries: [], projectQueries: [], commentQueries: [], writes: [], guards: [], visibility: [],
-    storage: [], commitActors: [], events: [], jobs: [], hidden: false, denied: false, readonly: null, resourceGrant: false,
+    storage: [], commitActors: [], events: [], jobs: [], contentQueries: [], contentRows: [], hydratedFiles: [],
+    hidden: false, denied: false, readonly: null, resourceGrant: false,
 }));
 
 function expectAuthorization(scope) {
@@ -187,6 +202,8 @@ test('draft publish commits and emits events as actual actor while using owner d
 });
 
 test('delegated blog detail validates read and keeps actual-viewer hidden filtering', async () => {
+    state.contentRows = [{ commit_file: 'file', sha256: 'file', source: null, create_time: 'created', create_userid: 9,
+        storage_provider: 's3', storage_bucket: 'private', storage_key: 'object', content_size: 15n, content_sha256: 'checksum' }];
     const req = { params: { id: '7' }, headers: { 'x-zerocat-delegation': '23' } };
     let status = 200, result;
     const res = { locals: { userid: 5, tokenType: 'personal', scopes: context.tokenScopes },
@@ -196,9 +213,16 @@ test('delegated blog detail validates read and keeps actual-viewer hidden filter
     assert.equal(status, 200);
     assert.equal(result.data.id, 7);
     assert.ok(state.visibility.every(query => query.actorId === 5));
+    assert.equal(state.contentQueries.length, 1);
+    assert.match(state.contentQueries[0].sql, /JOIN ow_projects_commits/);
+    assert.deepEqual(state.contentQueries[0].values, [7, 'main']);
+    assert.equal(state.hydratedFiles.length, 1);
+    assert.deepEqual(result.data.file, { sha256: 'file', source: 'hydrated source', create_time: 'created', create_userid: 9 });
     state.hidden = true;
     await blog.getPostDetail(req, res);
     assert.equal(status, 404);
+    assert.equal(state.contentQueries.length, 1);
+    assert.equal(state.hydratedFiles.length, 1);
 });
 
 test('blog metadata and unpublish refresh original credentials, keep article type and actor visibility', async () => {

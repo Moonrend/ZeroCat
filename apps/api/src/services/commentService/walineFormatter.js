@@ -51,7 +51,13 @@ function getDefaultAvatar(nick, mail) {
  */
 export async function formatComment(comment, options = {}) {
     const { isAdmin = false, spaceUser = null, zcUser = null, disableUserAgent = false, disableRegion = false, userLevelMap = null } = options;
-    const hiddenProfile = comment.account_user_id && !await canViewContent('profile', { id: Number(comment.account_user_id) }, options.viewerId || null);
+    const accountId = Number(comment.account_user_id);
+    const profileVisibility = options.profileVisibility;
+    const hasProfileVisibility = profileVisibility?.viewerId === (Number(options.viewerId) || null)
+        && profileVisibility.userIds.has(accountId);
+    const hiddenProfile = accountId && (hasProfileVisibility
+        ? profileVisibility.hiddenUserIds.has(accountId)
+        : !await canViewContent('profile', { id: accountId }, options.viewerId || null));
 
     let browser = '';
     let os = '';

@@ -24,6 +24,10 @@ mock.module('../prisma.js', { namedExports: { prisma: {
 } } });
 mock.module('../config/zcconfig.js', { defaultExport: { get: async (key, fallback) => key === 'bullmq.enabled' ? true : key === 'git.sync.enabled' ? state.featureEnabled : fallback ?? false } });
 mock.module('../assets.js', { namedExports: { downloadFromS3: async () => { throw new Error('Unexpected asset read'); } } });
+mock.module('../projectFileStorage.js', { namedExports: {
+    readProjectFile: async () => { throw new Error('Unexpected project content read'); },
+    readProjectFiles: async () => { throw new Error('Unexpected project content read'); },
+} });
 mock.module('../../controllers/notifications.js', { namedExports: { createNotification: async () => {} } });
 mock.module('./githubApp.js', { namedExports: { createInstallationToken: async () => {
     state.githubWrites++;

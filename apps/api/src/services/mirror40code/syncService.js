@@ -1,6 +1,7 @@
 import { createHash, createDecipheriv } from 'crypto';
 import axios from 'axios';
 import { prisma } from '../prisma.js';
+import { saveProjectFile } from '../projectFileStorage.js';
 import zcconfig from '../config/zcconfig.js';
 import logger from '../logger.js';
 import { uploadFile, uploadToS3 } from '../assets.js';
@@ -2106,15 +2107,7 @@ class Mirror40CodeSyncService {
 
         const sourceSha = hashSource(source);
 
-        await prisma.ow_projects_file.upsert({
-            where: { sha256: sourceSha },
-            update: {},
-            create: {
-                sha256: sourceSha,
-                source,
-                create_userid: localAuthorId,
-            },
-        });
+        await saveProjectFile(source, { userId: localAuthorId, sha256: sourceSha });
 
         const branch = 'main';
         const latestCommit = await prisma.ow_projects_commits.findFirst({

@@ -2,7 +2,8 @@ import { prisma } from '../prisma.js';
 import redisClient from '../redis.js';
 import logger from '../logger.js';
 import zcconfig from '../config/zcconfig.js';
-import { assertCanWrite, visibleWhere, canViewContent } from '../moderation/visibility.js';
+import { assertCanWrite, visibleWhere } from '../moderation/visibility.js';
+import { getCommentProfileVisibility } from './profileVisibility.js';
 import { sanitizeComment } from './sanitizer.js';
 
 const TASK_TTL = 86400; // 24h
@@ -128,10 +129,9 @@ export async function exportSpaceData(spaceId, spaceCuid, spaceName, taskId, pro
         }),
     ]);
 
-    const hiddenProfiles = new Set();
-    for (const accountId of new Set(comments.map(comment => comment.account_user_id).filter(Boolean))) {
-        if (!await canViewContent('profile', { id: accountId }, userId)) hiddenProfiles.add(accountId);
-    }
+    const { hiddenUserIds: hiddenProfiles } = await getCommentProfileVisibility(
+        comments.map(comment => comment.account_user_id), userId,
+    );
 
     const total = comments.length + counters.length + spaceUsers.length;
     let processed = 0;

@@ -11,7 +11,7 @@ const db = {
     ow_user_roles: { async findMany() { return state.roles; } },
     ow_user_permissions: { async findMany() { return state.permissions; } },
     ow_user_restrictions: {
-        async findMany() { return state.hidden.map(user_id => ({ user_id })); },
+        async findMany() { state.ownerReads++; return state.hidden.map(user_id => ({ user_id })); },
         async findFirst({ where }) { state.restrictionReads.push(where); return state.hidden.includes(where.user_id) ? { id: 1 } : null; },
     },
 };
@@ -23,13 +23,14 @@ mock.module(url("./restrictions.js"), { namedExports: {
 } });
 mock.module(url("../auth/policyEngine.js"), { namedExports: {
     getUserPolicy: async (_id, options) => options.targetId ? { candidate: Number(options.targetId) } : { sources: state.sources },
+    getUserResourcePolicies: async () => new Map(state.allowed.map(candidate => [candidate, { candidate }])),
     resourcePolicyAllowsScope: policy => state.allowed.includes(policy.candidate),
 } });
-const { visibleWhere, visibleSql, canViewContent } = await import("./visibility.js");
+const { visibleWhere, visibleSql, canViewContent, sanitizeProfiles } = await import("./visibility.js");
 const post = (id, owner, extra = {}) => ({ id, author_id: owner, post_type: "normal", is_deleted: false, deleted_at: null, is_shadowbanned: false, ...extra });
 const project = (id, owner, extra = {}) => ({ id, authorid: owner, state: "public", type: "scratch", deleted_at: null, is_shadowbanned: false, ...extra });
 beforeEach(() => Object.assign(state, {
-    posts: new Map(), projects: new Map(), lists: new Map(), hidden: [], roles: [], permissions: [], sources: [], allowed: [], restrictionReads: [],
+    posts: new Map(), projects: new Map(), lists: new Map(), hidden: [], roles: [], permissions: [], sources: [], allowed: [], restrictionReads: [], ownerReads: 0,
 }));
 
 test("author sees shadowban but cannot view deleted content", async () => {
@@ -108,6 +109,30 @@ test("private concrete global scope candidates are checked with targeted deny po
     const sql = await visibleSql("project", "p", 7);
     assert.ok(sql.values.includes(12));
     assert.equal(sql.values.includes(13), false);
+});
+
+test("retweet visibility shares one owner query per call and rereads newly hidden owners", async () => {
+    const first = await visibleWhere("post");
+    assert.equal(state.ownerReads, 1);
+    assert.deepEqual(first.AND[2], {});
+    state.hidden = [8];
+    const second = await visibleWhere("post");
+    assert.equal(state.ownerReads, 2);
+    assert.deepEqual(second.AND[2], { author_id: { notIn: [8] } });
+    assert.deepEqual(second.AND.at(-1).OR[1].retweet_post.is.AND[2], { author_id: { notIn: [8] } });
+});
+
+test("profile pages batch restrictions, preserve positions and reread revocations", async () => {
+    const users = [{ id: 7 }, { id: 8 }, { id: 8 }, null, { id: 9, is_shadowbanned: true }, { id: 7, deleted_at: new Date() }];
+    state.hidden = [7, 8];
+    assert.deepEqual(await sanitizeProfiles(users, 7), [users[0], null, null, null, null, null]);
+    assert.equal(state.ownerReads, 1);
+    state.hidden = [];
+    assert.deepEqual(await sanitizeProfiles(users, 7), [users[0], users[1], users[2], null, null, null]);
+    assert.equal(state.ownerReads, 2);
+    assert.deepEqual(await sanitizeProfiles([users[0], null], 7), [users[0], null]);
+    assert.equal(state.ownerReads, 2);
+    assert.deepEqual(await sanitizeProfiles(users, 7, { review: true, reviewAuthorized: true }), users);
 });
 
 test("review bypass requires both explicit authorized flags in all helpers", async () => {

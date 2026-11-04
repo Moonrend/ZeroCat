@@ -8,7 +8,8 @@ import { hasProjectPermission } from "../services/auth/permissionManager.js";
 import { setReviewStatus, isAutoApproveUser } from "../services/extensionReview.js";
 import { authorize } from "../services/auth/authorization.js";
 import { findProjectCommit } from "../services/projectCommitAccess.js";
-import { canViewContent, sanitizeProfile, visibleWhere } from "../services/moderation/visibility.js";
+import { readProjectFile } from "../services/projectFileStorage.js";
+import { canViewContent, sanitizeProfile, sanitizeProfiles, visibleWhere } from "../services/moderation/visibility.js";
 
 async function sanitizeExtension(extension, res) {
   const viewerId = res.locals.userid;
@@ -29,23 +30,66 @@ async function sanitizeExtension(extension, res) {
   return extension;
 }
 
+// Call only for rows selected with visibleWhere('extension', viewerId) in this request.
+async function sanitizeVisibleExtensions(extensions, res) {
+  const viewerId = res.locals.userid;
+  const allowed = [];
+  for (const extension of extensions) {
+    let permitted = true;
+    if (viewerId) {
+      for (const requiredScope of [`extension:${extension.id}:read`, `project:${extension.projectid}:read`]) {
+        const decision = await authorize({ actorId: viewerId, tokenType: res.locals.tokenType,
+          tokenScopes: res.locals.scopes || [], requiredScope });
+        if (!decision.allowed) { permitted = false; break; }
+      }
+    }
+    if (permitted) allowed.push(extension);
+  }
+  const sampleIds = [...new Set(allowed.map(extension => extension.sample_project?.id).filter(Boolean))];
+  const visibleSamples = new Set();
+  if (sampleIds.length) {
+    const visibility = await visibleWhere('project', viewerId);
+    for (let offset = 0; offset < sampleIds.length; offset += 500) {
+      const samples = await prisma.ow_projects.findMany({
+        where: { id: { in: sampleIds.slice(offset, offset + 500) }, AND: [visibility] }, select: { id: true },
+      });
+      samples.forEach(sample => visibleSamples.add(sample.id));
+    }
+  }
+  const authoredProjects = [];
+  for (const extension of allowed) {
+    if (extension.sample_project && !visibleSamples.has(extension.sample_project.id)) extension.sample_project = null;
+    for (const project of [extension.project, extension.sample_project]) {
+      if (project?.author) authoredProjects.push(project);
+    }
+  }
+  const profiles = await sanitizeProfiles(authoredProjects.map(project => ({
+    ...project.author, id: project.author.id ?? project.authorid,
+  })), viewerId);
+  authoredProjects.forEach((project, index) => { if (!profiles[index]) project.author = null; });
+  return allowed;
+}
+
 async function requireExtensionProject(req, res, next) {
   try {
-    const extension = await prisma.ow_scratch_extensions.findUnique({ where: { id: Number(req.params.id) } });
+    const extension = await prisma.ow_scratch_extensions.findUnique({
+      where: { id: Number(req.params.id) }, include: { project: true },
+    });
     if (!extension) return res.status(404).send({ status: 'error', message: '扩展不存在' });
     const decision = await authorize({
       actorId: res.locals.userid, tokenType: res.locals.tokenType, tokenScopes: res.locals.scopes || [],
       requiredScope: `project:${extension.projectid}:update`, action: 'manage',
     });
     if (!decision.allowed) return res.status(decision.status).send({ status: 'error', code: decision.code, message: decision.message });
+    res.locals.extension = extension;
     next();
   } catch (error) { next(error); }
 }
 
 const router = Router();
 let s3staticurl=await zcconfig.get("s3.staticurl");
-async function validateBranchAndCommit(projectid, branch, commit, userid) {
-  const project = await prisma.ow_projects.findFirst({
+async function validateBranchAndCommit(projectid, branch, commit, userid, loadedProject = null) {
+  const project = loadedProject || await prisma.ow_projects.findFirst({
     where: { id: Number(projectid) },
   });
 
@@ -123,7 +167,8 @@ router.post("/manager/create", needLogin, requireResource("project", "update", "
       projectid,
       branch,
       commit,
-      res.locals.userid
+      res.locals.userid,
+      project
     );
 
     let samplesProjectId = null;
@@ -200,10 +245,7 @@ router.put("/manager/edit/:id", needLogin, requireResource("extension", "manage"
     const { id } = req.params;
     const { branch, commit, image, samples, docs, scratchCompatible } = req.body;
 
-    const extension = await prisma.ow_scratch_extensions.findFirst({
-      where: { id: Number(id) },
-      include: { project: true },
-    });
+    const extension = res.locals.extension;
 
     if (!extension) {
       return res.status(404).send({
@@ -227,7 +269,8 @@ router.put("/manager/edit/:id", needLogin, requireResource("extension", "manage"
           extension.projectid,
           branch,
           commit,
-          res.locals.userid
+          res.locals.userid,
+          extension.project
         );
       updateData.branch = validatedBranch;
       updateData.commit = validatedCommit;
@@ -288,10 +331,7 @@ router.post("/manager/update/:id", needLogin, requireResource("extension", "mana
   try {
     const { id } = req.params;
 
-    const extension = await prisma.ow_scratch_extensions.findFirst({
-      where: { id: Number(id) },
-      include: { project: true },
-    });
+    const extension = res.locals.extension;
 
     if (!extension) {
       return res.status(404).send({
@@ -357,10 +397,7 @@ router.post("/manager/submit/:id", needLogin, requireResource("extension", "mana
   try {
     const { id } = req.params;
     // 查找扩展及其项目作者
-    const extension = await prisma.ow_scratch_extensions.findFirst({
-      where: { id: Number(id) },
-      include: { project: true },
-    });
+    const extension = res.locals.extension;
     if (!extension) {
       return res.status(404).send({
         status: "error",
@@ -452,7 +489,7 @@ router.get("/manager/my", needLogin, requireScope("extension:read"), async (req,
     res.status(200).send({
       status: "success",
       message: "获取成功",
-      data: (await Promise.all(extensions.map((extension) => sanitizeExtension(extension, res)))).filter(Boolean),
+      data: await sanitizeVisibleExtensions(extensions, res),
     });
   } catch (err) {
     logger.error("Error getting my extensions:", err);
@@ -467,10 +504,7 @@ router.delete("/manager/:id", needLogin, requireResource("extension", "manage", 
   try {
     const { id } = req.params;
 
-    const extension = await prisma.ow_scratch_extensions.findFirst({
-      where: { id: Number(id) },
-      include: { project: true },
-    });
+    const extension = res.locals.extension;
 
     if (!extension) {
       return res.status(404).send({
@@ -557,7 +591,7 @@ router.get("/detail/:id", async (req, res, next) => {
 
     res.status(200).send({
       status: "success",
-      data: await sanitizeExtension(extension, res)
+      data: extension
     });
   } catch (err) {
     logger.error("Error getting extension detail:", err);
@@ -627,7 +661,7 @@ router.get("/detailbyprojectid/:id", async (req, res, next) => {
 
     res.status(200).send({
       status: "success",
-      data: await sanitizeExtension(extension, res)
+      data: extension
     });
   } catch (err) {
     logger.error("Error getting extension detail:", err);
@@ -687,7 +721,7 @@ router.post("/detail/batch", needLogin, requireResource("extension", "read", (re
     });
 
     const extensionMap = new Map(
-      (await Promise.all(extensions.map((ext) => sanitizeExtension(ext, res))))
+      (await sanitizeVisibleExtensions(extensions, res))
         .filter((ext) => ext && (ext.status === 'verified' || ext.project.authorid === res.locals.userid))
         .map((ext) => [ext.id, ext])
     );
@@ -751,7 +785,7 @@ router.get("/", async (req, res, next) => {
       },
     });
 
-    const visibleExtensions = (await Promise.all(extensions.map((ext) => sanitizeExtension(ext, res)))).filter(Boolean);
+    const visibleExtensions = (await sanitizeVisibleExtensions(extensions, res)).filter(Boolean);
     const formattedExtensions = visibleExtensions.map((ext) => {
       logger.debug(ext)
       const result = {
@@ -835,11 +869,7 @@ router.get("/{:id}.js", async (req, res, next) => {
       });
     }
     logger.debug(commitRecord);
-    const file=await prisma.ow_projects_file.findFirst({
-      where: {
-        sha256: commitRecord.commit_file,
-      },
-    });
+    const file = await readProjectFile(commitRecord.commit_file);
     if (!file) {
       return res.status(404).send({
         status: "error",
