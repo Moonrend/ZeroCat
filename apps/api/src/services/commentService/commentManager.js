@@ -11,6 +11,7 @@ import { renderMarkdown } from './markdown.js';
 import { visibleWhere, visibleSql, canViewContent, assertCanWrite } from '../moderation/visibility.js';
 import { getCommentProfileVisibility } from './profileVisibility.js';
 import { authorizeResourceOperation } from '../auth/resourceOperation.js';
+import { scopeSatisfies } from '../auth/scopes.js';
 
 async function authorizeCommentOperation(spaceId, commentId, action, userId, options = {}) {
     const { authorizationContext, spaceCuid } = options;
@@ -143,7 +144,8 @@ export async function createComment(spaceId, data, config, userInfo = null) {
             throw Object.assign(new Error('您已被该空间封禁'), { statusCode: 403, errno: 1009 });
         }
 
-        if (spaceUser && (spaceUser.type === 'administrator' || spaceUser.type === 'moderator')) {
+        if (spaceUser && (spaceUser.type === 'administrator' || spaceUser.type === 'moderator')
+            && scopeSatisfies(userInfo.scopes || [], 'comment:manage')) {
             status = 'approved';
         } else if (config.audit === 'true') {
             status = 'waiting';

@@ -1,6 +1,6 @@
 import logger from '../services/logger.js';
 import { prisma } from '../services/prisma.js';
-import { verifyWalineToken } from '../services/commentService/walineAuth.js';
+import { isWalineScopeGranted, verifyWalineToken } from '../services/commentService/walineAuth.js';
 import { getSpaceConfig, getSpaceUser } from '../services/commentService/spaceManager.js';
 
 /**
@@ -63,6 +63,7 @@ export const walineSpaceResolver = async (req, res, next) => {
         req.spaceConfig = config;
         req.walineUser = null;
         req.walineSpaceUser = null;
+        req.walineToken = null;
 
         // 解析 Waline JWT (从 Authorization header)
         const authHeader = req.headers['authorization'];
@@ -71,16 +72,24 @@ export const walineSpaceResolver = async (req, res, next) => {
             const token = parts.length === 2 && parts[0].toLowerCase() === 'bearer'
                 ? parts[1]
                 : authHeader;
+            req.walineToken = token;
 
-            const { valid, userId } = verifyWalineToken(token, space.jwt_secret);
+            const { valid, userId, scopes, jti, parentTokenId } = await verifyWalineToken(
+                token,
+                space.jwt_secret,
+                { spaceId: space.id, spaceCuid: space.cuid },
+            );
             if (valid && userId) {
-                req.walineUser = { userId };
+                req.walineUser = { userId, scopes, jti, parentTokenId };
 
                 // 加载空间用户信息
                 const spaceUser = await getSpaceUser(space.id, userId);
                 if (spaceUser) {
-                    req.walineSpaceUser = spaceUser;
-                    req.walineUser.type = spaceUser.type;
+                    const effectiveType = isWalineScopeGranted(scopes, 'comment:manage')
+                        ? spaceUser.type
+                        : 'guest';
+                    req.walineSpaceUser = { ...spaceUser, type: effectiveType };
+                    req.walineUser.type = effectiveType;
                     req.walineUser.nick = spaceUser.display_name;
                     req.walineUser.mail = spaceUser.email;
                     req.walineUser.link = spaceUser.url;
@@ -119,7 +128,8 @@ export const walineSpaceResolver = async (req, res, next) => {
 export const isSpaceAdmin = (req) => {
     if (!req.walineUser) return false;
     const type = req.walineUser.type;
-    return type === 'administrator' || type === 'moderator';
+    return (type === 'administrator' || type === 'moderator')
+        && isWalineScopeGranted(req.walineUser.scopes, 'comment:manage');
 };
 
 /**

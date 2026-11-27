@@ -60,7 +60,7 @@ mock.module(url('../activitypub/index.js'), { namedExports: {
 mock.module(url('../commentService/walineFormatter.js'), { namedExports: {
     async formatComment(record) { return record; }, async formatCommentsWithChildren() { return []; },
 } });
-mock.module(url('../commentService/spaceManager.js'), { namedExports: { async getSpaceUser() { return null; } } });
+mock.module(url('../commentService/spaceManager.js'), { namedExports: { async getSpaceUser() { return state.spaceUser; } } });
 mock.module(url('../commentService/sanitizer.js'), { namedExports: { sanitizeComment(value) { return value; } } });
 mock.module(url('../commentService/akismetService.js'), { namedExports: { async checkAkismetSpam() { return false; } } });
 mock.module(url('../commentService/levelService.js'), { namedExports: { async batchGetUserLevels() { return new Map(); } } });
@@ -92,7 +92,7 @@ beforeEach(() => Object.assign(state, {
     readonly: false, hidden: false, hiddenProfile: false, comment: null, contexts: 0, sent: 0,
     task: { user_id: 7, space_id: 3, type: 'import' }, spaceOwner: 7,
     exportComments: [], userReads: [], exportCache: null, notifyComment: null, notifyParent: null,
-    projectReads: [], featuredProject: null,
+    projectReads: [], featuredProject: null, spaceUser: null,
 }));
 
 for (const scope of ['projects', 'users', 'posts']) {
@@ -133,6 +133,28 @@ test('authenticated comment creation records trusted account ownership', async (
     const record = await comments.createComment(3, { comment: 'text', url: '/' }, {}, { userId: 7, nick: 'member' });
     assert.equal(record.account_user_id, 7);
     assert.equal(record.user_id, '7');
+});
+
+test('moderator role without comment:manage does not bypass comment audit', async () => {
+    state.spaceUser = { type: 'moderator' };
+    const record = await comments.createComment(
+        3,
+        { comment: 'text', url: '/' },
+        { audit: 'true' },
+        { userId: 7, scopes: ['comment:create'] },
+    );
+    assert.equal(record.status, 'waiting');
+});
+
+test('moderator role with comment:manage retains comment auto-approval', async () => {
+    state.spaceUser = { type: 'moderator' };
+    const record = await comments.createComment(
+        3,
+        { comment: 'text', url: '/' },
+        { audit: 'true' },
+        { userId: 7, scopes: ['comment:manage'] },
+    );
+    assert.equal(record.status, 'approved');
 });
 
 test('legacy display user_id does not authorize editing an unverified imported comment', async () => {

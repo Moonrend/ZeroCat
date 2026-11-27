@@ -1,5 +1,4 @@
 import logger from "../services/logger.js";
-import zcconfig from "../services/config/zcconfig.js";
 import {Router} from "express";
 import {prisma} from "../services/prisma.js";
 import {validateUsername} from "../services/global.js";
@@ -9,21 +8,10 @@ import { requireScope } from "../middleware/scope.js";
 import {assignDefaultRolesToUser, userSatisfiesPolicy} from "../services/auth/policyEngine.js";
 import { scopeSatisfies } from "../services/auth/scopes.js";
 import {createEvent} from "../controllers/events.js";
-import jwt from "jsonwebtoken";
 import * as bcrypt from "bcrypt";
-import {PasswordHash} from "phpass";
 import { changeUsername, getRecommendedUsersForUser, sanitizeFeaturedProjects, sanitizeFeaturedProjectsBatch } from "../controllers/users.js";
 import { buildAvatarURL } from "../utils/avatarUrl.js";
 import { visibleWhere, assertCanWrite } from "../services/moderation/visibility.js";
-
- // PHPass hasher for legacy password validation
- const passwordHash = new PasswordHash();
-
-// Helper function to check if password is hashed with PHPass
-function isPhpassHash(hash) {
-    // PHPass hashes typically start with $P$, $H$, or $2a$ for WordPress, Drupal, etc.
-    return hash.startsWith("$P$") || hash.startsWith("$H$");
-}
 
 const router = Router();
 
@@ -383,112 +371,6 @@ router.post("/register", async function (req, res, next) {
         });
     } catch (error) {
         logger.error("用户注册出错:", error);
-        next(error);
-    }
-});
-
-// 用户登录
-router.post("/login", async function (req, res, next) {
-    try {
-        const {username, password} = req.body;
-
-        // 简单验证
-        if (!username || !password) {
-            return res.status(400).json({
-                status: "error",
-                code: "validation_error",
-                message: "用户名和密码为必填项",
-            });
-        }
-
-        // 查找用户
-        const user = await prisma.ow_users.findFirst({
-            where: {
-                OR: [{username}, {email: username}],
-            },
-        });
-
-        // 用户不存在
-        if (!user) {
-            return res.status(401).json({
-                status: "error",
-                code: "authentication_failed",
-                message: "用户名或密码错误",
-            });
-        }
-
-        // 账户被禁用
-        if (user.status !== "active") {
-            return res.status(401).json({
-                status: "error",
-                code: "authentication_failed",
-                message: "账户已被禁用",
-            });
-        }
-
-        // 验证密码
-        let passwordValid = false;
-
-        // 检查密码哈希类型并验证
-        if (isPhpassHash(user.password)) {
-            // 使用PHPass验证
-            passwordValid = passwordHash.checkPassword(password, user.password);
-
-            // 如果验证成功，将密码升级为bcrypt哈希
-            if (passwordValid) {
-                const newHash = await bcrypt.hash(password, 10);
-                await prisma.ow_users.update({
-                    where: {id: user.id},
-                    data: {password: newHash},
-                });
-            }
-        } else {
-            // 使用bcrypt验证
-            passwordValid = await bcrypt.compare(password, user.password);
-        }
-
-        if (!passwordValid) {
-            return res.status(401).json({
-                status: "error",
-                code: "authentication_failed",
-                message: "用户名或密码错误",
-            });
-        }
-
-        // 获取JWT密钥
-        const jwtSecret = await zcconfig.get("security.jwttoken");
-
-        // 生成令牌
-        const token = jwt.sign(
-            {
-                userid: user.id,
-                username: user.username,
-            },
-            jwtSecret,
-            {expiresIn: "7d"}
-        );
-
-        // 更新最后登录时间
-        await prisma.ow_users.update({
-            where: {id: user.id},
-            data: {last_login: new Date()},
-        });
-
-        // 返回登录结果
-        res.json({
-            status: "success",
-            data: {
-                token,
-                user: {
-                    id: user.id,
-                    username: user.username,
-                    display_name: user.display_name,
-                    type: user.type,
-                },
-            },
-        });
-    } catch (error) {
-        logger.error("用户登录出错:", error);
         next(error);
     }
 });

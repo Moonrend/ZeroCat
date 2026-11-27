@@ -4,7 +4,6 @@
  * 内置投递去重：同一 activity 不会重复投递给同一服务器
  */
 
-import axios from 'axios';
 import { prisma } from '../prisma.js';
 import { assertCanWrite, visibleWhere } from '../moderation/visibility.js';
 import logger from '../logger.js';
@@ -15,6 +14,7 @@ import { getActorKeyId } from './actor.js';
 import { getLocalUserById } from './actor.js';
 import { getRemoteFollowers, recordDelivery, isDelivered } from './store.js';
 import { getSharedInboxUrl, fetchRemoteActor } from './federation.js';
+import { federationRequest, validateFederationDestination } from './federationHttp.js';
 
 /**
  * 发送已签名的 ActivityPub 请求
@@ -63,7 +63,10 @@ export async function deliverActivity({ inbox, activity, userId, username, skipD
         // 先转为 Buffer，确保 Digest 计算和 HTTP 发送使用完全相同的字节
         const bodyStr = JSON.stringify(activity);
         const bodyBuf = Buffer.from(bodyStr, 'utf-8');
-        const url = new URL(inbox);
+        // Validate before loading signing material, then validate and pin again
+        // at connection time inside federationRequest.
+        const safeInbox = (await validateFederationDestination(inbox)).url;
+        const url = new URL(safeInbox);
         const privateKey = await getUserPrivateKey(userId);
         const keyId = await getActorKeyId(username);
         const digest = digestBody(bodyBuf);
@@ -88,9 +91,11 @@ export async function deliverActivity({ inbox, activity, userId, username, skipD
             headers,
         });
 
-        logger.debug(`[ap-delivery] 投递到 ${inbox}, keyId=${keyId}, digest=${digest}`);
+        logger.debug(`[ap-delivery] 投递到 ${safeInbox}, keyId=${keyId}, digest=${digest}`);
 
-        const response = await axios.post(inbox, bodyBuf, {
+        const response = await federationRequest(safeInbox, {
+            method: 'POST',
+            data: bodyBuf,
             headers: {
                 'Host': url.host,
                 'Date': dateStr,
@@ -102,7 +107,7 @@ export async function deliverActivity({ inbox, activity, userId, username, skipD
                 'Accept': AP_CONTENT_TYPE,
             },
             timeout: 30000,
-            maxRedirects: 0,
+            followRedirects: false,
             validateStatus: () => true,
             // 禁止 axios 转换 Buffer body
             transformRequest: [(data) => data],

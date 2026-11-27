@@ -25,6 +25,10 @@ const sendServiceError = (res, err, fallback = "服务器错误") => {
   });
 };
 
+router.get("/authoring-session", needLogin, requireScope("blog:create"), (req, res) => {
+  res.json({ status: "success", data: { id: res.locals.userid } });
+});
+
 router.get("/drafts", needLogin, requireScope("blog:read"), async (req, res) => {
   try {
     const drafts = await draftService.listDrafts(res.locals.userid);

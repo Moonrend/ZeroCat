@@ -8,7 +8,15 @@ import express from 'express';
 import logger from '../services/logger.js';
 import { prisma } from '../services/prisma.js';
 import zcconfig from '../services/config/zcconfig.js';
+import { needAdmin, needLogin } from '../middleware/auth.js';
+import { createRateLimit } from '../middleware/rateLimit.js';
+import { requireSudo } from '../middleware/sudo.js';
 import { visibleWhere, canViewContent } from '../services/moderation/visibility.js';
+import {
+    ACTIVITYPUB_BODY_LIMIT,
+    ACTIVITYPUB_JSON_TYPES,
+    captureActivityPubRawBody,
+} from '../middleware/requestBody.js';
 import {
     AP_CONTENT_TYPE, AP_CONTEXT,
     getInstanceDomain, getInstanceBaseUrl, getApEndpointBaseUrl, getStaticUrl,
@@ -40,19 +48,21 @@ import {
 } from '../services/activitypub/index.js';
 
 const router = Router();
-
-// ─── AP Body Parser：解析 activity+json / ld+json 并保留原始 body ───
-router.use(express.json({
-    type: [
-        'application/activity+json',
-        'application/ld+json',
-        'application/json',
-    ],
-    limit: '1mb',
-    verify: (req, _res, buf) => {
-        // 保存原始 Buffer 用于 Digest / Signature 验证
-        req.rawBody = buf;
+const remoteResolutionRateLimit = createRateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    prefix: 'rate_limit:activitypub_remote_resolution:',
+    message: {
+        status: 'error',
+        message: 'Remote federation resolution is temporarily rate limited',
     },
+});
+
+// ─── AP Body Parser：解析 AP JSON，仅为 inbox 签名验证保留原始 body ───
+router.use(express.json({
+    type: ACTIVITYPUB_JSON_TYPES,
+    limit: ACTIVITYPUB_BODY_LIMIT,
+    verify: captureActivityPubRawBody,
 }));
 
 // ─── 中间件：检查联邦是否启用 ──────────────────────────────
@@ -289,11 +299,7 @@ router.post('/users/:username/inbox', requireFederation, async (req, res) => {
         const verification = await verifyInboxRequest(req);
         if (!verification.valid) {
             logger.warn(`[ap-route] 收件箱签名验证失败 ${username}: ${verification.message}`);
-            // 在开发环境可以放宽验证
-            if (process.env.NODE_ENV === 'production') {
-                return res.status(401).json({ error: verification.message });
-            }
-            logger.warn('[ap-route] 在没有有效签名的情况下继续(非生产环境)');
+            return res.status(401).json({ error: verification.message });
         }
 
         const activity = req.body;
@@ -301,12 +307,8 @@ router.post('/users/:username/inbox', requireFederation, async (req, res) => {
             return res.status(400).json({ error: 'Invalid activity' });
         }
 
-        // 获取远程 Actor
-        const remoteActor = verification.actor || await (async () => {
-            const { fetchRemoteActor } = await import('../services/activitypub/federation.js');
-            const actorUrl = typeof activity.actor === 'string' ? activity.actor : activity.actor?.id;
-            return actorUrl ? fetchRemoteActor(actorUrl) : null;
-        })();
+        // 只使用已通过签名和身份绑定验证的远程 Actor
+        const remoteActor = verification.actor;
 
         if (!remoteActor) {
             return res.status(400).json({ error: 'Could not resolve actor' });
@@ -330,7 +332,7 @@ router.post('/inbox', requireFederation, async (req, res) => {
     try {
         // 验证 HTTP Signature
         const verification = await verifyInboxRequest(req);
-        if (!verification.valid && process.env.NODE_ENV === 'production') {
+        if (!verification.valid) {
             return res.status(401).json({ error: verification.message });
         }
 
@@ -339,11 +341,7 @@ router.post('/inbox', requireFederation, async (req, res) => {
             return res.status(400).json({ error: 'Invalid activity' });
         }
 
-        const remoteActor = verification.actor || await (async () => {
-            const { fetchRemoteActor } = await import('../services/activitypub/federation.js');
-            const actorUrl = typeof activity.actor === 'string' ? activity.actor : activity.actor?.id;
-            return actorUrl ? fetchRemoteActor(actorUrl) : null;
-        })();
+        const remoteActor = verification.actor;
 
         if (!remoteActor) {
             return res.status(400).json({ error: 'Could not resolve actor' });
@@ -621,19 +619,8 @@ router.get('/status', async (req, res) => {
  * POST /ap/admin/setup
  * Body: { domain?, name?, description?, enabled?, autoAcceptFollows? }
  */
-router.post('/admin/setup', async (req, res) => {
+router.post('/admin/setup', needAdmin, requireSudo, async (req, res) => {
     try {
-        // 验证管理员权限
-        if (!res.locals.userid) {
-            return res.status(401).json({ error: 'Authentication required' });
-        }
-
-        const zcconfig = (await import('../services/config/zcconfig.js')).default;
-        const adminUsers = await zcconfig.get('security.adminusers');
-        if (!adminUsers?.includes(String(res.locals.userid))) {
-            return res.status(403).json({ error: 'Admin access required' });
-        }
-
         const { initializeActivityPub } = await import('../services/activitypub/setup.js');
         const result = await initializeActivityPub(req.body);
 
@@ -649,18 +636,8 @@ router.post('/admin/setup', async (req, res) => {
  * PATCH /ap/admin/federation
  * Body: { enabled: boolean }
  */
-router.patch('/admin/federation', async (req, res) => {
+router.patch('/admin/federation', needAdmin, requireSudo, async (req, res) => {
     try {
-        if (!res.locals.userid) {
-            return res.status(401).json({ error: 'Authentication required' });
-        }
-
-        const zcconfig = (await import('../services/config/zcconfig.js')).default;
-        const adminUsers = await zcconfig.get('security.adminusers');
-        if (!adminUsers?.includes(String(res.locals.userid))) {
-            return res.status(403).json({ error: 'Admin access required' });
-        }
-
         const { setFederationEnabled } = await import('../services/activitypub/setup.js');
         await setFederationEnabled(Boolean(req.body.enabled));
 
@@ -688,19 +665,6 @@ router.get('/users/:username/remote-followers/count', async (req, res) => {
     }
 });
 
-// ─── 管理员验证中间件 ─────────────────────────────────────────
-
-async function requireAdmin(req, res, next) {
-    if (!res.locals.userid) {
-        return res.status(401).json({ error: 'Authentication required' });
-    }
-    const adminUsers = await zcconfig.get('security.adminusers');
-    if (!adminUsers?.includes(String(res.locals.userid))) {
-        return res.status(403).json({ error: 'Admin access required' });
-    }
-    next();
-}
-
 // ═══════════════════════════════════════════════════════════════
 // 联邦实例配置管理 (白名单/黑名单)
 // ═══════════════════════════════════════════════════════════════
@@ -709,7 +673,7 @@ async function requireAdmin(req, res, next) {
  * 获取联邦实例配置
  * GET /ap/admin/federation/config
  */
-router.get('/admin/federation/config', requireAdmin, async (req, res) => {
+router.get('/admin/federation/config', needAdmin, async (req, res) => {
     try {
         const config = await getFederationConfig();
         return res.json({ status: 'ok', data: config });
@@ -724,7 +688,7 @@ router.get('/admin/federation/config', requireAdmin, async (req, res) => {
  * PATCH /ap/admin/federation/config
  * Body: { policy?, allowedInstances?, blockedInstances?, autoFetchPosts?, maxFetchPosts?, allowRemoteSearch? }
  */
-router.patch('/admin/federation/config', requireAdmin, async (req, res) => {
+router.patch('/admin/federation/config', needAdmin, async (req, res) => {
     try {
         const { policy, allowedInstances, blockedInstances, autoFetchPosts, maxFetchPosts, allowRemoteSearch } = req.body;
 
@@ -763,7 +727,7 @@ router.patch('/admin/federation/config', requireAdmin, async (req, res) => {
  * POST /ap/admin/federation/allowlist
  * Body: { domain: string }
  */
-router.post('/admin/federation/allowlist', requireAdmin, async (req, res) => {
+router.post('/admin/federation/allowlist', needAdmin, async (req, res) => {
     try {
         const { domain } = req.body;
         if (!domain || typeof domain !== 'string') {
@@ -782,7 +746,7 @@ router.post('/admin/federation/allowlist', requireAdmin, async (req, res) => {
  * 移除允许的实例
  * DELETE /ap/admin/federation/allowlist/:domain
  */
-router.delete('/admin/federation/allowlist/:domain', requireAdmin, async (req, res) => {
+router.delete('/admin/federation/allowlist/:domain', needAdmin, async (req, res) => {
     try {
         await removeAllowedInstance(req.params.domain);
         const config = await getFederationConfig();
@@ -798,7 +762,7 @@ router.delete('/admin/federation/allowlist/:domain', requireAdmin, async (req, r
  * POST /ap/admin/federation/blocklist
  * Body: { domain: string }
  */
-router.post('/admin/federation/blocklist', requireAdmin, async (req, res) => {
+router.post('/admin/federation/blocklist', needAdmin, async (req, res) => {
     try {
         const { domain } = req.body;
         if (!domain || typeof domain !== 'string') {
@@ -817,7 +781,7 @@ router.post('/admin/federation/blocklist', requireAdmin, async (req, res) => {
  * 移除封禁的实例
  * DELETE /ap/admin/federation/blocklist/:domain
  */
-router.delete('/admin/federation/blocklist/:domain', requireAdmin, async (req, res) => {
+router.delete('/admin/federation/blocklist/:domain', needAdmin, async (req, res) => {
     try {
         await removeBlockedInstance(req.params.domain);
         const config = await getFederationConfig();
@@ -836,7 +800,7 @@ router.delete('/admin/federation/blocklist/:domain', requireAdmin, async (req, r
  * 联邦综合统计概览
  * GET /ap/admin/federation/stats
  */
-router.get('/admin/federation/stats', requireAdmin, async (req, res) => {
+router.get('/admin/federation/stats', needAdmin, async (req, res) => {
     try {
         // 基础统计
         const [configGroups, totalLocalPosts] = await Promise.all([
@@ -912,7 +876,7 @@ router.get('/admin/federation/stats', requireAdmin, async (req, res) => {
  * 列出所有有远程关注者的本地用户
  * GET /ap/admin/federation/users?page=1&limit=20
  */
-router.get('/admin/federation/users', requireAdmin, async (req, res) => {
+router.get('/admin/federation/users', needAdmin, async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
@@ -956,7 +920,7 @@ router.get('/admin/federation/users', requireAdmin, async (req, res) => {
  * 查看某用户的远程关注者详情
  * GET /ap/admin/federation/users/:userId/followers?page=1&limit=50
  */
-router.get('/admin/federation/users/:userId/followers', requireAdmin, async (req, res) => {
+router.get('/admin/federation/users/:userId/followers', needAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.userId);
         if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user ID' });
@@ -991,7 +955,7 @@ router.get('/admin/federation/users/:userId/followers', requireAdmin, async (req
  * 查看远程代理用户列表（管理员版）
  * GET /ap/admin/federation/proxy-users?page=1&limit=20&q=keyword
  */
-router.get('/admin/federation/proxy-users', requireAdmin, async (req, res) => {
+router.get('/admin/federation/proxy-users', needAdmin, async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
@@ -1024,7 +988,7 @@ router.get('/admin/federation/proxy-users', requireAdmin, async (req, res) => {
  * 查看帖子的完整同步状态
  * GET /ap/admin/federation/posts/:postId/sync-status
  */
-router.get('/admin/federation/posts/:postId/sync-status', requireAdmin, async (req, res) => {
+router.get('/admin/federation/posts/:postId/sync-status', needAdmin, async (req, res) => {
     try {
         const postId = parseInt(req.params.postId);
         if (isNaN(postId)) return res.status(400).json({ error: 'Invalid post ID' });
@@ -1082,7 +1046,7 @@ router.get('/admin/federation/posts/:postId/sync-status', requireAdmin, async (r
  * 列出已同步的帖子
  * GET /ap/admin/federation/posts?page=1&limit=20&platform=activitypub|twitter|bluesky
  */
-router.get('/admin/federation/posts', requireAdmin, async (req, res) => {
+router.get('/admin/federation/posts', needAdmin, async (req, res) => {
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
@@ -1146,7 +1110,7 @@ router.get('/admin/federation/posts', requireAdmin, async (req, res) => {
  * POST /ap/admin/federation/posts/:postId/resync
  * Body: { platforms?: ['activitypub','twitter','bluesky'] }
  */
-router.post('/admin/federation/posts/:postId/resync', requireAdmin, async (req, res) => {
+router.post('/admin/federation/posts/:postId/resync', needAdmin, async (req, res) => {
     try {
         const postId = parseInt(req.params.postId);
         if (isNaN(postId)) return res.status(400).json({ error: 'Invalid post ID' });
@@ -1177,7 +1141,7 @@ router.post('/admin/federation/posts/:postId/resync', requireAdmin, async (req, 
  * 管理员手动触发帖子推送到 AP 关注者
  * POST /ap/admin/federation/posts/:postId/push-ap
  */
-router.post('/admin/federation/posts/:postId/push-ap', requireAdmin, async (req, res) => {
+router.post('/admin/federation/posts/:postId/push-ap', needAdmin, async (req, res) => {
     try {
         const postId = parseInt(req.params.postId);
         if (isNaN(postId)) return res.status(400).json({ error: 'Invalid post ID' });
@@ -1211,7 +1175,7 @@ router.post('/admin/federation/posts/:postId/push-ap', requireAdmin, async (req,
  * POST /ap/admin/federation/proxy-users/:userId/fetch-posts
  * Body: { maxPosts?: number }
  */
-router.post('/admin/federation/proxy-users/:userId/fetch-posts', requireAdmin, async (req, res) => {
+router.post('/admin/federation/proxy-users/:userId/fetch-posts', needAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.userId);
         if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user ID' });
@@ -1238,7 +1202,7 @@ router.post('/admin/federation/proxy-users/:userId/fetch-posts', requireAdmin, a
  * 管理员手动触发远程用户资料刷新
  * POST /ap/admin/federation/proxy-users/:userId/refresh
  */
-router.post('/admin/federation/proxy-users/:userId/refresh', requireAdmin, async (req, res) => {
+router.post('/admin/federation/proxy-users/:userId/refresh', needAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.userId);
         if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user ID' });
@@ -1269,7 +1233,7 @@ router.post('/admin/federation/proxy-users/:userId/refresh', requireAdmin, async
  * 管理员向指定用户的所有远程关注者触发历史帖子回填
  * POST /ap/admin/federation/users/:userId/backfill
  */
-router.post('/admin/federation/users/:userId/backfill', requireAdmin, async (req, res) => {
+router.post('/admin/federation/users/:userId/backfill', needAdmin, async (req, res) => {
     try {
         const userId = parseInt(req.params.userId);
         if (isNaN(userId)) return res.status(400).json({ error: 'Invalid user ID' });
@@ -1303,7 +1267,7 @@ router.post('/admin/federation/users/:userId/backfill', requireAdmin, async (req
  * AP 联邦队列状态和管理
  * GET /ap/admin/federation/queue
  */
-router.get('/admin/federation/queue', requireAdmin, async (req, res) => {
+router.get('/admin/federation/queue', needAdmin, async (req, res) => {
     try {
         const { getApFederationQueue } = await import('../services/queue/queues.js');
         const { getSocialSyncQueue } = await import('../services/queue/queues.js');
@@ -1340,7 +1304,7 @@ router.get('/admin/federation/queue', requireAdmin, async (req, res) => {
  * POST /ap/admin/federation/queue/pause
  * POST /ap/admin/federation/queue/resume
  */
-router.post('/admin/federation/queue/:action', requireAdmin, async (req, res) => {
+router.post('/admin/federation/queue/:action', needAdmin, async (req, res) => {
     try {
         const { action } = req.params;
         if (!['pause', 'resume'].includes(action)) {
@@ -1372,7 +1336,7 @@ router.post('/admin/federation/queue/:action', requireAdmin, async (req, res) =>
  * 搜索/解析远程用户（支持 @user@domain 格式）
  * GET /ap/remote/users/search?q=@user@domain
  */
-router.get('/remote/users/search', requireFederation, async (req, res) => {
+router.get('/remote/users/search', needLogin, remoteResolutionRateLimit, requireFederation, async (req, res) => {
     try {
         const keyword = req.query.q || req.query.keyword || '';
         if (!keyword) {
@@ -1411,7 +1375,7 @@ router.get('/remote/users/search', requireFederation, async (req, res) => {
  * POST /ap/remote/users/resolve
  * Body: { acct: "@user@domain" } 或 { actorUrl: "https://..." }
  */
-router.post('/remote/users/resolve', requireFederation, async (req, res) => {
+router.post('/remote/users/resolve', needLogin, remoteResolutionRateLimit, requireFederation, async (req, res) => {
     try {
         const { acct, actorUrl } = req.body;
         if (!acct && !actorUrl) {

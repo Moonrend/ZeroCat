@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { parseToken, needLogin } from '../middleware/auth.js';
 import { scopeSatisfies } from '../services/auth/scopes.js';
 import { userSatisfiesPolicy } from '../services/auth/policyEngine.js';
+import { createRateLimit } from '../middleware/rateLimit.js';
 import {
     sendCode,
     auth,
@@ -10,10 +11,41 @@ import {
 
 const router = Router();
 
+const passwordResetLimiter = createRateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    prefix: 'rate_limit:password_reset:',
+    message: {
+        status: 'error',
+        message: '密码重置请求过于频繁，请稍后再试'
+    }
+});
+
+const limitPasswordReset = (req, res, next) => {
+    if (req.body?.purpose !== 'reset_password') {
+        return next();
+    }
+    return passwordResetLimiter(req, res, next);
+};
+
 const AUTHENTICATED_PURPOSE_SCOPES = {
     sudo: null,
     change_email: "user:update",
     delete_account: "user:delete",
+};
+
+const requireProtectedPasswordAuthentication = (req, res, next) => {
+    const { method, purpose } = req.body || {};
+    if (method !== "password"
+        || Object.prototype.hasOwnProperty.call(AUTHENTICATED_PURPOSE_SCOPES, purpose)) {
+        return next();
+    }
+
+    return res.status(400).json({
+        status: "error",
+        message: "公开认证流程不支持密码验证，请使用受保护的登录接口",
+        code: "ZC_ERROR_PASSWORD_AUTH_UNAVAILABLE",
+    });
 };
 
 const requirePurposeAuthorization = (req, res, next) => {
@@ -73,7 +105,7 @@ router.get('/methods', getAuthMethods);
  * - purpose: 认证目的 (login, sudo, reset_password, change_email, delete_account)
  * - userId: 用户ID（某些场景下可选，会从登录状态获取）
  */
-router.post('/send-code', requirePurposeAuthorization, sendCode);
+router.post('/send-code', limitPasswordReset, requirePurposeAuthorization, sendCode);
 
 /**
  * POST /auth/authenticate
@@ -89,7 +121,8 @@ router.post('/send-code', requirePurposeAuthorization, sendCode);
  * - code_id: 验证码ID（email方式）
  * - code: 验证码（email方式）
  * - new_password: 新密码（reset_password时必填）
+ * 密码登录必须使用带反自动化保护的 POST /account/login；此处密码方式仅支持已登录的安全验证。
  */
-router.post('/authenticate', requirePurposeAuthorization, auth);
+router.post('/authenticate', requireProtectedPasswordAuthentication, limitPasswordReset, requirePurposeAuthorization, auth);
 
 export default router;

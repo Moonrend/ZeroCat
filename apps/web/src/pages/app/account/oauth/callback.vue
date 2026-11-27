@@ -75,16 +75,8 @@ onMounted(async () => {
       authStore.setAuthRedirectUrl(redirectFromQuery);
     }
 
-    // 从URL中提取临时令牌
-    const urlParams = new URLSearchParams(window.location.search);
-    const tempToken = urlParams.get('temp_token');
-
-    if (!tempToken) {
-      throw new Error('未找到临时令牌，请重新登录');
-    }
-
-    // 调用API验证临时令牌并获取用户信息
-    const response = await axios.get(`/account/oauth/validate-token/${tempToken}`);
+    // HttpOnly Cookie 中的临时令牌和 OAuth 事务由浏览器自动随请求发送。
+    const response = await axios.post('/account/oauth/validate-token');
     const data = response.data;
 
     if (data.status === 'success') {

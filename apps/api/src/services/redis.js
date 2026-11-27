@@ -2,6 +2,55 @@ import Redis from 'ioredis';
 import logger from './logger.js';
 import zcconfig from './config/zcconfig.js';
 
+const INCREMENT_WITH_EXPIRY_SCRIPT = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return count
+`;
+
+const CONSUME_VERIFICATION_CODE_SCRIPT = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return {'missing'}
+end
+
+local decoded, challenge = pcall(cjson.decode, raw)
+if not decoded or type(challenge) ~= 'table' then
+    redis.call('DEL', KEYS[1])
+    return {'invalid'}
+end
+
+local function reject_challenge()
+    local attempts = tonumber(challenge.attemptsRemaining) or tonumber(ARGV[4])
+    local ttl = redis.call('PTTL', KEYS[1])
+    attempts = attempts - 1
+
+    if attempts <= 0 or ttl <= 0 then
+        redis.call('DEL', KEYS[1])
+        return {'locked', '0'}
+    end
+
+    challenge.attemptsRemaining = attempts
+    redis.call('SET', KEYS[1], cjson.encode(challenge), 'PX', ttl)
+    return {'invalid', tostring(attempts)}
+end
+
+if tostring(challenge.purpose or '') ~= ARGV[2] then
+    return reject_challenge()
+end
+if ARGV[3] ~= '' and tostring(challenge.userId or '') ~= ARGV[3] then
+    return reject_challenge()
+end
+if tostring(challenge.code or '') ~= ARGV[1] then
+    return reject_challenge()
+end
+
+redis.call('DEL', KEYS[1])
+return {'valid', cjson.encode(challenge)}
+`;
+
 class RedisService {
     constructor() {
         this.client = null;
@@ -218,6 +267,56 @@ class RedisService {
         } catch (error) {
             logger.error(`[redis] Redis incrby错误 [${key}]:`, error);
             return null;
+        }
+    }
+
+    // 原子递增计数器，并仅在首次递增时设置过期时间
+    async incrementWithExpiry(key, ttlSeconds) {
+        try {
+            if (!this.client || !this.isConnected) {
+                throw new Error('[redis] Redis未连接');
+            }
+
+            return await this.client.eval(INCREMENT_WITH_EXPIRY_SCRIPT, 1, key, ttlSeconds);
+        } catch (error) {
+            logger.error(`[redis] Redis incrementWithExpiry错误 [${key}]:`, error);
+            return null;
+        }
+    }
+
+    // 原子验证、计次并消费一次性邮件验证码
+    async consumeVerificationCode(key, { code, purpose, userId = null, maxAttempts }) {
+        try {
+            if (!this.client || !this.isConnected) {
+                throw new Error('[redis] Redis未连接');
+            }
+
+            const result = await this.client.eval(
+                CONSUME_VERIFICATION_CODE_SCRIPT,
+                1,
+                key,
+                String(code),
+                String(purpose),
+                userId === null || userId === undefined ? '' : String(userId),
+                String(maxAttempts)
+            );
+
+            if (!Array.isArray(result) || !result[0]) {
+                return { status: 'error' };
+            }
+
+            const [status, payload] = result;
+            if (status === 'valid') {
+                return { status, data: JSON.parse(payload) };
+            }
+
+            return {
+                status,
+                attemptsRemaining: payload === undefined ? undefined : Number(payload)
+            };
+        } catch (error) {
+            logger.error(`[redis] Redis consumeVerificationCode错误 [${key}]:`, error);
+            return { status: 'error' };
         }
     }
 }

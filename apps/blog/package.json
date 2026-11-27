@@ -9,7 +9,8 @@
     "dev": "next dev -p 4000",
     "build": "next build",
     "start": "next start -p 4000",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:cover-security": "node --test src/app/api/covers/render/cover-render-handler.test.mjs src/lib/article-cover-contract.test.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",

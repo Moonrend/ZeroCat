@@ -247,6 +247,7 @@ async function syncOAuthAvatarIfNeeded({
         tags: 'oauth-sync',
         uploaderIp: 'oauth-sync',
         uploaderUa: 'ZeroCat-OAuth/1.0',
+        enforceFederationPolicy: false,
         extraMetadata: {
             provider,
             providerUserId: userInfo?.id || null,

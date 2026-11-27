@@ -2,7 +2,10 @@ import path from "node:path";
 import { readFile } from "node:fs/promises";
 import satori from "satori";
 import { truncate } from "./utils";
-import type { ArticleCoverInput } from "./article-cover";
+import {
+  pickArticleCoverExcerptLines,
+  type ArticleCoverInput,
+} from "./article-cover-contract";
 
 const coverFontPath = path.resolve(
   process.cwd(),
@@ -14,37 +17,10 @@ const coverFontPath = path.resolve(
 
 const fontDataPromise = readFile(coverFontPath);
 
-function cleanMarkdown(value: string) {
-  return value
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-    .replace(/^>\s?/gm, "")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/^[-*+]\s+/gm, "")
-    .replace(/^\d+\.\s+/gm, "")
-    .replace(/[\*_~]/g, "")
-    .replace(/\r/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function pickExcerptLines(input: ArticleCoverInput) {
-  const source = `${input.summary?.trim() ? `${input.summary.trim()}\n\n` : ""}${cleanMarkdown(input.content || "")}`.trim();
-
-  return source
-    .split("\n")
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean)
-    .slice(0, 3)
-    .map((line) => truncate(line, 34));
-}
-
 export async function renderArticleCoverDataUrl(input: ArticleCoverInput) {
   const coverFont = await fontDataPromise;
   const title = truncate((input.title || "未命名文章").trim(), 32);
-  const excerptLines = pickExcerptLines(input);
+  const excerptLines = pickArticleCoverExcerptLines(input);
 
   const svg = await satori(
     <div

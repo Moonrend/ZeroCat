@@ -11,5 +11,5 @@ services:
       - "3000:3000"
     restart: unless-stopped  # 推荐值，更安全
     environment:
-      - NODE_ENV=production
-      - DATABASE_URL=mysql://root:123456@host.docker.internal:3557/zerocat_develop
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set to a dedicated PostgreSQL application role}

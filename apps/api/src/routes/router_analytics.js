@@ -3,8 +3,22 @@ import {prisma} from "../services/prisma.js";
 import logger from "../services/logger.js";
 import {UAParser} from 'ua-parser-js';
 import ipLocation from '../services/ip/ipLocation.js';
+import {strictTokenCheck} from '../middleware/auth.js';
+import {requireScope} from '../middleware/scope.js';
 
 const router = express.Router();
+const MAX_STATS_RANGE_MS = 31 * 24 * 60 * 60 * 1000;
+
+function parseStatsRange(startAtValue, endAtValue) {
+    if (typeof startAtValue !== 'string' || typeof endAtValue !== 'string') return null;
+
+    const startAt = new Date(startAtValue);
+    const endAt = new Date(endAtValue);
+    if (Number.isNaN(startAt.getTime()) || Number.isNaN(endAt.getTime())) return null;
+    if (endAt < startAt || endAt.getTime() - startAt.getTime() > MAX_STATS_RANGE_MS) return null;
+
+    return {startAt, endAt};
+}
 
 // URL 解析函数
 function parseURL(url) {
@@ -194,35 +208,43 @@ router.post('/send', async (req, res) => {
 });
 
 // 获取统计数据
-router.get('/stats', async (req, res) => {
+router.get('/stats', strictTokenCheck, requireScope('admin:analytics:read'), async (req, res) => {
     try {
-        const {start_at, end_at, fingerprint, user_id} = req.query;
-
-        const where = {
-            created_at: {
-                gte: new Date(start_at),
-                lte: new Date(end_at),
-            }
-        };
-
-        if (fingerprint) {
-            where.device = {
-                fingerprint
-            };
+        if (Object.hasOwn(req.query, 'fingerprint') || Object.hasOwn(req.query, 'user_id')) {
+            return res.status(400).json({
+                success: false,
+                error: 'Per-user and per-device analytics filters are not supported',
+            });
         }
 
-        if (user_id) {
-            where.user_id = parseInt(user_id);
+        const range = parseStatsRange(req.query.start_at, req.query.end_at);
+        if (!range) {
+            return res.status(400).json({
+                success: false,
+                error: 'start_at and end_at must be valid dates spanning no more than 31 days',
+            });
         }
 
-        const events = await prisma.ow_analytics_event.findMany({
-            where,
-            include: {
-                device: true
-            }
+        const eventCount = await prisma.ow_analytics_event.count({
+            where: {
+                created_at: {
+                    gte: range.startAt,
+                    lte: range.endAt,
+                },
+            },
         });
 
-        res.json({success: true, data: events});
+        const data = {
+            start_at: range.startAt.toISOString(),
+            end_at: range.endAt.toISOString(),
+            event_count: eventCount,
+        };
+        logger.info('[analytics] Aggregate stats accessed', {
+            actor_id: res.locals.userid,
+            ...data,
+        });
+
+        res.json({success: true, data});
     } catch (error) {
         logger.error('[analytics] Failed to get stats:', error);
         res.status(500).json({success: false, error: 'Internal server error'});

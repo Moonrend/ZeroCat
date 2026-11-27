@@ -11,6 +11,9 @@ import {checkhash, hash, S3update, validateUsername} from "../services/global.js
 import multer from "multer";
 import {createEvent} from "../controllers/events.js";
 import { validateFileTypeFromContent, uploadFile } from "../services/assets.js";
+import {needLogin} from "../middleware/auth.js";
+import {requireScope} from "../middleware/scope.js";
+import {assertCanWrite} from "../services/moderation/visibility.js";
 
 var router = Router();
 
@@ -119,8 +122,17 @@ router.use((err, req, res, next) => {
     }
 });
 
+async function requireProfileWrite(req, res, next) {
+    try {
+        await assertCanWrite(res.locals.userid, "profile", "update");
+        next();
+    } catch (error) {
+        next(error);
+    }
+}
+
 //修改个人信息
-router.post("/set/userinfo", async (req, res) => {
+router.post("/set/userinfo", needLogin, requireScope("user:update"), requireProfileWrite, async (req, res) => {
     try {
         const updateData = {
             display_name: req.body.display_name,
