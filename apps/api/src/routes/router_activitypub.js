@@ -8,7 +8,8 @@ import express from 'express';
 import logger from '../services/logger.js';
 import { prisma } from '../services/prisma.js';
 import zcconfig from '../services/config/zcconfig.js';
-import { needAdmin } from '../middleware/auth.js';
+import { needAdmin, needLogin } from '../middleware/auth.js';
+import { createRateLimit } from '../middleware/rateLimit.js';
 import { requireSudo } from '../middleware/sudo.js';
 import { visibleWhere, canViewContent } from '../services/moderation/visibility.js';
 import {
@@ -47,6 +48,15 @@ import {
 } from '../services/activitypub/index.js';
 
 const router = Router();
+const remoteResolutionRateLimit = createRateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    prefix: 'rate_limit:activitypub_remote_resolution:',
+    message: {
+        status: 'error',
+        message: 'Remote federation resolution is temporarily rate limited',
+    },
+});
 
 // ─── AP Body Parser：解析 AP JSON，仅为 inbox 签名验证保留原始 body ───
 router.use(express.json({
@@ -1326,7 +1336,7 @@ router.post('/admin/federation/queue/:action', needAdmin, async (req, res) => {
  * 搜索/解析远程用户（支持 @user@domain 格式）
  * GET /ap/remote/users/search?q=@user@domain
  */
-router.get('/remote/users/search', requireFederation, async (req, res) => {
+router.get('/remote/users/search', needLogin, remoteResolutionRateLimit, requireFederation, async (req, res) => {
     try {
         const keyword = req.query.q || req.query.keyword || '';
         if (!keyword) {
@@ -1365,7 +1375,7 @@ router.get('/remote/users/search', requireFederation, async (req, res) => {
  * POST /ap/remote/users/resolve
  * Body: { acct: "@user@domain" } 或 { actorUrl: "https://..." }
  */
-router.post('/remote/users/resolve', requireFederation, async (req, res) => {
+router.post('/remote/users/resolve', needLogin, remoteResolutionRateLimit, requireFederation, async (req, res) => {
     try {
         const { acct, actorUrl } = req.body;
         if (!acct && !actorUrl) {

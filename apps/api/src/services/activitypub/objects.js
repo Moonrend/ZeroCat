@@ -6,10 +6,10 @@
 import { prisma } from '../prisma.js';
 import logger from '../logger.js';
 import { visibleWhere, canViewContent } from '../moderation/visibility.js';
-import axios from 'axios';
 import { AP_CONTEXT, AP_ACCEPT_TYPES, getApEndpointBaseUrl, getInstanceBaseUrl, getInstanceDomain, getStaticUrl } from './config.js';
 import { getActorUrl } from './actor.js';
 import { resolveWebFinger } from './federation.js';
+import { federationGet, validateFederationDestination } from './federationHttp.js';
 import { v4 as uuidv4 } from 'uuid';
 import twitterText from 'twitter-text';
 
@@ -130,13 +130,16 @@ function writeProbeCache(url, ok) {
 }
 
 async function isPublicApObjectReachable(url) {
-    const cached = readCachedProbeResult(url);
-    if (cached !== null) {
-        return cached;
-    }
-
+    let cacheKey = url;
     try {
-        const response = await axios.get(url, {
+        // Revalidate cached probe keys so historical state cannot label a URL
+        // public after policy or DNS changes make it unsafe.
+        const safeUrl = (await validateFederationDestination(url)).url;
+        cacheKey = safeUrl;
+        const cached = readCachedProbeResult(safeUrl);
+        if (cached !== null) return cached;
+
+        const response = await federationGet(safeUrl, {
             timeout: REMOTE_REF_PROBE_TIMEOUT_MS,
             maxRedirects: 3,
             headers: {
@@ -149,10 +152,10 @@ async function isPublicApObjectReachable(url) {
         const data = response?.data;
         const type = Array.isArray(data?.type) ? data.type.join(',') : String(data?.type || '');
         const ok = Boolean(data && typeof data === 'object' && data.id && type);
-        writeProbeCache(url, ok);
+        writeProbeCache(safeUrl, ok);
         return ok;
     } catch {
-        writeProbeCache(url, false);
+        writeProbeCache(cacheKey, false);
         return false;
     }
 }

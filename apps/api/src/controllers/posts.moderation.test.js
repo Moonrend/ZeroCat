@@ -30,6 +30,7 @@ const db = {
     async groupBy() { return []; },
     async create({ data }) {
       state.writes.push("create");
+      state.createdPosts.push(data);
       if (state.allowCreate) return post(100, data.author_id, data);
       throw new Error("Unexpected content creation");
     },
@@ -94,6 +95,7 @@ beforeEach(() => {
   state.posts = [];
   state.calls = [];
   state.writes = [];
+  state.createdPosts = [];
   state.restriction = null;
   state.analyticsQueries = [];
   state.mediaWrites = [];
@@ -232,6 +234,30 @@ test("post media writes are batched with deduplicated attachment order", async (
     { post_id: 100, asset_id: 8, order: 1 },
     { post_id: 100, asset_id: 7, order: 2 },
   ]);
+});
+
+test("URL embeds discard client thumbnail targets while retaining preview metadata", async () => {
+  state.allowCreate = true;
+  await createPost({
+    authorId: 2,
+    content: "preview post",
+    embed: {
+      type: "url",
+      url: "https://example.test/article",
+      title: "Example article",
+      description: "A safe preview",
+      image: "https://cdn.example.test/preview.webp",
+      thumbnail: "https://untrusted.example/thumbnail.png",
+    },
+  });
+
+  assert.deepEqual(state.createdPosts[0].embed, {
+    type: "url",
+    url: "https://example.test/article",
+    title: "Example article",
+    description: "A safe preview",
+    image: "https://cdn.example.test/preview.webp",
+  });
 });
 
 test("post analytics reuse view totals and count distinct devices without loading event rows", async () => {

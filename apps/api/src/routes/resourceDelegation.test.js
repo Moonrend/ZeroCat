@@ -79,6 +79,15 @@ async function request(path, method = 'GET', body) {
         ...(body ? { body: JSON.stringify(body) } : {}) });
 }
 
+test('cover authoring session requires the blog creation scope', async () => {
+    const response = await fetch(`${origin}/blog/authoring-session`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { status: 'success', data: { id: 5 } });
+    assert.equal(state.auth.length, 1);
+    assert.equal(state.auth[0].requiredScope, 'blog:create');
+    assert.equal(state.auth[0].allowDelegation, undefined);
+});
+
 for (const [path, method, body, scope, operation] of [
     ['/lists/listid/4', 'GET', null, 'list:4:read', 'getProjectList'],
     ['/lists/update/4', 'POST', { title: 'x' }, 'list:4:update', 'updateList'],

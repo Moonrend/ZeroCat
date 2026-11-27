@@ -34,6 +34,20 @@ const AUTHENTICATED_PURPOSE_SCOPES = {
     delete_account: "user:delete",
 };
 
+const requireProtectedPasswordAuthentication = (req, res, next) => {
+    const { method, purpose } = req.body || {};
+    if (method !== "password"
+        || Object.prototype.hasOwnProperty.call(AUTHENTICATED_PURPOSE_SCOPES, purpose)) {
+        return next();
+    }
+
+    return res.status(400).json({
+        status: "error",
+        message: "公开认证流程不支持密码验证，请使用受保护的登录接口",
+        code: "ZC_ERROR_PASSWORD_AUTH_UNAVAILABLE",
+    });
+};
+
 const requirePurposeAuthorization = (req, res, next) => {
     const { purpose } = req.body || {};
     if (!Object.prototype.hasOwnProperty.call(AUTHENTICATED_PURPOSE_SCOPES, purpose)) {
@@ -107,7 +121,8 @@ router.post('/send-code', limitPasswordReset, requirePurposeAuthorization, sendC
  * - code_id: 验证码ID（email方式）
  * - code: 验证码（email方式）
  * - new_password: 新密码（reset_password时必填）
+ * 密码登录必须使用带反自动化保护的 POST /account/login；此处密码方式仅支持已登录的安全验证。
  */
-router.post('/authenticate', limitPasswordReset, requirePurposeAuthorization, auth);
+router.post('/authenticate', requireProtectedPasswordAuthentication, limitPasswordReset, requirePurposeAuthorization, auth);
 
 export default router;

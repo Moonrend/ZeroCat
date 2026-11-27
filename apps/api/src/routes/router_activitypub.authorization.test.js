@@ -20,7 +20,8 @@ mock.module('express', {
 mock.module('../services/logger.js', { defaultExport: { error: noop } });
 mock.module('../services/prisma.js', { namedExports: { prisma: {} } });
 mock.module('../services/config/zcconfig.js', { defaultExport: {} });
-mock.module('../middleware/auth.js', { namedExports: { needAdmin } });
+mock.module('../middleware/auth.js', { namedExports: { needAdmin, needLogin: noop } });
+mock.module('../middleware/rateLimit.js', { namedExports: { createRateLimit: () => noop } });
 mock.module('../middleware/sudo.js', { namedExports: { requireSudo } });
 mock.module('../services/moderation/visibility.js', { namedExports: {
     visibleWhere: noop,

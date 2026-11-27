@@ -330,11 +330,11 @@ function WritePageInner() {
   }, [dirty]);
 
   React.useEffect(() => {
-    if (cover) return;
+    if (cover || !token) return;
 
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void generateArticleCoverDataUrl(coverInput, controller.signal)
+      void generateArticleCoverDataUrl(coverInput, token, controller.signal)
         .then((next) => {
           if (!controller.signal.aborted) setGeneratedCover(next);
         })
@@ -347,7 +347,7 @@ function WritePageInner() {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [cover, coverInput]);
+  }, [cover, coverInput, token]);
 
   React.useEffect(() => {
     const username = user?.username;
@@ -382,13 +382,14 @@ function WritePageInner() {
 
   const ensureGeneratedCover = React.useCallback(async () => {
     if (cover) return cover;
+    if (!token) throw new Error("未登录");
     if (!generatedCover) {
-      const next = await generateArticleCoverDataUrl(coverInput);
+      const next = await generateArticleCoverDataUrl(coverInput, token);
       setGeneratedCover(next);
       return next;
     }
     return generatedCover;
-  }, [cover, coverInput, generatedCover]);
+  }, [cover, coverInput, generatedCover, token]);
 
   const ensureUploadedCover = React.useCallback(async () => {
     if (cover) return cover;

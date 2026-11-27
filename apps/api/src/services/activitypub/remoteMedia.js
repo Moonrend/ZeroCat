@@ -9,6 +9,7 @@ import { createHash } from 'crypto';
 import sharp from 'sharp';
 import logger from '../logger.js';
 import { prisma } from '../prisma.js';
+import { federationGet, publicNetworkGet } from './federationHttp.js';
 import {
     generateMD5,
     uploadToS3,
@@ -56,6 +57,7 @@ function setCachedHash(remoteUrl, md5) {
  * @param {'avatar'|'banner'} options.purpose - 用途（决定裁剪策略）
  * @param {number|null} options.proxyUserId  - 关联的代理用户 ID（存入 uploader_id）
  * @param {string|null} options.actorUrl     - 来源 Actor URL（写入 metadata）
+ * @param {boolean} options.enforceFederationPolicy - 是否应用联邦实例策略
  * @returns {Promise<string>} 本地 MD5 哈希；失败时返回 DEFAULT_HASH
  */
 export async function cacheRemoteImage(remoteUrl, {
@@ -68,6 +70,7 @@ export async function cacheRemoteImage(remoteUrl, {
     uploaderIp = 'activitypub-sync',
     uploaderUa = 'ZeroCat-AP-Federation/1.0',
     extraMetadata = null,
+    enforceFederationPolicy = true,
 } = {}) {
     if (!remoteUrl || typeof remoteUrl !== 'string') return DEFAULT_HASH;
 
@@ -83,7 +86,7 @@ export async function cacheRemoteImage(remoteUrl, {
         }
 
         // ── 1. 下载远程图片 ──────────────────────────────
-        const buffer = await downloadRemoteImage(remoteUrl);
+        const buffer = await downloadRemoteImage(remoteUrl, { enforceFederationPolicy });
         if (!buffer || buffer.length === 0) {
             logger.warn(`[ap-media] 下载失败或为空: ${remoteUrl}（详见上一条下载失败/HTTP异常日志）`);
             return DEFAULT_HASH;
@@ -214,36 +217,40 @@ export async function cacheActorMedia(actor, proxyUserId = null) {
 /**
  * 下载远程图片（带超时 & 大小限制）
  */
-async function downloadRemoteImage(url) {
+async function downloadRemoteImage(url, { enforceFederationPolicy = true } = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
 
     try {
-        const resp = await fetch(url, {
+        const safeGet = enforceFederationPolicy ? federationGet : publicNetworkGet;
+        const resp = await safeGet(url, {
             signal: controller.signal,
+            timeout: FETCH_TIMEOUT,
+            responseType: 'stream',
+            maxRedirects: 5,
             headers: {
                 'Accept': 'image/*',
                 'User-Agent': 'ZeroCat-AP-Federation/1.0',
             },
-            redirect: 'follow',
+            validateStatus: () => true,
         });
 
-        if (!resp.ok) {
+        if (resp.status < 200 || resp.status >= 300) {
+            resp.data?.destroy?.();
             logger.warn('[ap-media] 远程图片 HTTP 异常', {
                 url,
                 status: resp.status,
                 statusText: resp.statusText,
-                redirected: resp.redirected,
-                finalUrl: resp.url,
-                contentType: resp.headers.get('content-type') || null,
-                contentLength: resp.headers.get('content-length') || null,
+                contentType: resp.headers?.['content-type'] || null,
+                contentLength: resp.headers?.['content-length'] || null,
             });
             return null;
         }
 
         // 检查 Content-Length
-        const contentLength = parseInt(resp.headers.get('content-length') || '0', 10);
+        const contentLength = parseInt(resp.headers?.['content-length'] || '0', 10);
         if (contentLength > MAX_DOWNLOAD_SIZE) {
+            resp.data?.destroy?.();
             logger.warn(`[ap-media] 远程图片过大 (${contentLength} bytes): ${url}`);
             return null;
         }
@@ -251,18 +258,15 @@ async function downloadRemoteImage(url) {
         // 流式读取（防止超大响应）
         const chunks = [];
         let totalSize = 0;
-        const reader = resp.body.getReader();
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            totalSize += value.length;
+        for await (const value of resp.data) {
+            const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+            totalSize += chunk.length;
             if (totalSize > MAX_DOWNLOAD_SIZE) {
-                reader.cancel();
+                resp.data.destroy();
                 logger.warn(`[ap-media] 远程图片下载超限 (>${MAX_DOWNLOAD_SIZE}): ${url}`);
                 return null;
             }
-            chunks.push(value);
+            chunks.push(chunk);
         }
 
         return Buffer.concat(chunks);
