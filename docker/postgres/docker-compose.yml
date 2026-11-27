@@ -5,12 +5,12 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: zerocat
-      POSTGRES_PASSWORD: zerocat_pass_change_me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a unique value}
       POSTGRES_DB: zerocat
       TZ: Asia/Shanghai
       PGTZ: Asia/Shanghai
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import logger from '../../services/logger.js';
 import {
     sendVerificationCode,
@@ -7,6 +8,16 @@ import { prisma } from '../../services/prisma.js'
 import { hash, userpwTest } from '../../services/global.js';
 
 import { generateSudoToken } from '../../services/auth/sudoAuth.js';
+
+const RESET_CODE_RESPONSE_MESSAGE = '如果该邮箱已注册，验证码将发送到您的邮箱';
+
+function sendPasswordResetCodeResponse(res, codeId = crypto.randomUUID()) {
+    return res.json({
+        status: 'success',
+        message: RESET_CODE_RESPONSE_MESSAGE,
+        data: { code_id: codeId }
+    });
+}
 
 /**
  * 发送验证码统一接口
@@ -60,6 +71,9 @@ export async function sendCode(req, res) {
             const resolvedUserStatus = emailContact?.user?.status || fallbackUser?.status || null;
 
             if (!resolvedUserId || resolvedUserStatus !== 'active') {
+                if (purpose === 'reset_password') {
+                    return sendPasswordResetCodeResponse(res);
+                }
                 return res.status(404).json({
                     status: 'error',
                     message: '该邮箱未注册',
@@ -79,6 +93,10 @@ export async function sendCode(req, res) {
         }
 
         const result = await sendVerificationCode(userId, email, purpose);
+
+        if (purpose === 'reset_password') {
+            return sendPasswordResetCodeResponse(res, result.success ? result.codeId : undefined);
+        }
 
         if (result.success) {
             res.json({

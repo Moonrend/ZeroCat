@@ -6,8 +6,9 @@
 import logger from '../logger.js';
 import { prisma } from '../prisma.js';
 import { getInstanceBaseUrl, getInstanceDomain, isAutoAcceptFollows } from './config.js';
-import { fetchRemoteActor, getPublicKeyFromActor } from './federation.js';
+import { fetchRemoteActor } from './federation.js';
 import { verifySignature, verifyDigest, parseSignatureHeader } from './httpSignature.js';
+import { getKeyDocumentUrl, validateActorKeyBinding, validateActivityActorBinding } from './identityBinding.js';
 import { getLocalUserByUsername, buildActorObject, getActorUrl } from './actor.js';
 import {
     addRemoteFollower, removeRemoteFollower, isRemoteFollower,
@@ -49,15 +50,23 @@ export async function verifyInboxRequest(req) {
     }
 
     // 通过 keyId 获取远程 Actor 和公钥
-    const actorUrl = parsed.keyId.split('#')[0];
+    const actorUrl = getKeyDocumentUrl(parsed.keyId);
+    if (!actorUrl) {
+        return { valid: false, actor: null, message: 'Signature keyId is not a valid HTTP URL' };
+    }
+
     const actor = await fetchRemoteActor(actorUrl, true);
     if (!actor) {
         return { valid: false, actor: null, message: `Could not fetch actor: ${actorUrl}` };
     }
 
-    const publicKey = getPublicKeyFromActor(actor);
-    if (!publicKey) {
-        return { valid: false, actor: null, message: 'No public key found in actor' };
+    const actorBinding = validateActorKeyBinding({
+        actor,
+        keyId: parsed.keyId,
+        localBaseUrl: await getInstanceBaseUrl(),
+    });
+    if (!actorBinding.valid) {
+        return { valid: false, actor: null, message: actorBinding.message };
     }
 
     // 验证签名
@@ -74,14 +83,28 @@ export async function verifyInboxRequest(req) {
         method: req.method,
         path: req.originalUrl || req.url,
         headers: headersForVerify,
-        publicKey,
+        publicKey: actorBinding.publicKeyPem,
     });
 
     if (!isValid) {
-        return { valid: false, actor, message: 'Signature verification failed' };
+        return { valid: false, actor: null, message: 'Signature verification failed' };
     }
 
-    return { valid: true, actor, message: 'OK' };
+    const activityBinding = validateActivityActorBinding(req.body, actorBinding.actorId);
+    if (!activityBinding.valid) {
+        return { valid: false, actor: null, message: activityBinding.message };
+    }
+
+    const verifiedActor = {
+        ...actor,
+        id: actorBinding.actorId,
+        publicKey: {
+            ...actor.publicKey,
+            id: actorBinding.keyId,
+            owner: actorBinding.actorId,
+        },
+    };
+    return { valid: true, actor: verifiedActor, message: 'OK' };
 }
 
 /**
@@ -92,6 +115,12 @@ export async function verifyInboxRequest(req) {
  */
 export async function processInboxActivity(activity, remoteActor, targetUsername = null) {
     const type = activity.type;
+
+    const identityBinding = validateActivityActorBinding(activity, remoteActor?.id);
+    if (!identityBinding.valid) {
+        logger.warn(`[ap-inbox] 拒绝身份不匹配的 ${type || 'unknown'} 活动: ${identityBinding.message}`);
+        return { handled: false, error: identityBinding.message, type };
+    }
 
     logger.info(`[ap-inbox] 正在处理来自 ${remoteActor?.id || 'unknown'} 的 ${type} 活动`);
 

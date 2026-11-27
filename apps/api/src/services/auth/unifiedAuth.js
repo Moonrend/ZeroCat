@@ -9,6 +9,10 @@ import twoFactor from './twoFactor.js';
 
 const VERIFICATION_CODE_PREFIX = 'verify_code:';
 const VERIFICATION_CODE_EXPIRY = 5 * 60; // 5分钟
+const MAX_VERIFICATION_ATTEMPTS = 5;
+const RESET_CODE_ISSUE_PREFIX = 'verify_code_issue:reset_password:';
+const RESET_CODE_ISSUE_WINDOW = 15 * 60;
+const MAX_RESET_CODE_ISSUES = 3;
 
 /**
  * 统一的身份认证服务
@@ -30,6 +34,16 @@ export class UnifiedAuthService {
         try {
             if (!userId) {
                 return { success: false, message: '缺少用户信息' };
+            }
+
+            if (purpose === 'reset_password') {
+                const issueCount = await redisClient.incrementWithExpiry(
+                    `${RESET_CODE_ISSUE_PREFIX}${userId}`,
+                    RESET_CODE_ISSUE_WINDOW
+                );
+                if (issueCount === null || issueCount > MAX_RESET_CODE_ISSUES) {
+                    return { success: false, message: '验证码发送过于频繁，请稍后再试' };
+                }
             }
 
             let targetEmail = typeof email === 'string' ? email.trim() : null;
@@ -112,6 +126,7 @@ export class UnifiedAuthService {
                 email: targetEmail,
                 userId,
                 purpose,
+                attemptsRemaining: MAX_VERIFICATION_ATTEMPTS,
                 createdAt: Date.now()
             }, VERIFICATION_CODE_EXPIRY);
 
@@ -150,29 +165,34 @@ export class UnifiedAuthService {
      * 验证邮件验证码
      * @param {string} codeId 验证码ID
      * @param {string} code 验证码
+     * @param {string} purpose 请求的认证目的
      * @param {number} userId 用户ID（可选，用于额外验证）
      * @returns {Promise<{valid: boolean, message: string, data?: any}>}
      */
-    async verifyEmailCode(codeId, code, userId = null) {
+    async verifyEmailCode(codeId, code, purpose, userId = null) {
         try {
             const codeKey = `${VERIFICATION_CODE_PREFIX}${codeId}`;
-            const storedData = await redisClient.get(codeKey);
+            const verification = await redisClient.consumeVerificationCode(codeKey, {
+                code,
+                purpose,
+                userId,
+                maxAttempts: MAX_VERIFICATION_ATTEMPTS
+            });
 
-            if (!storedData) {
+            if (verification.status === 'missing') {
                 return { valid: false, message: '验证码无效或已过期' };
             }
-
-            if (storedData.code !== code) {
+            if (verification.status === 'locked') {
+                return { valid: false, message: '验证码尝试次数过多，请重新获取' };
+            }
+            if (verification.status === 'invalid') {
                 return { valid: false, message: '验证码错误' };
             }
-
-            // 如果提供了用户ID，验证是否匹配
-            if (userId && Number(storedData.userId) !== Number(userId)) {
-                return { valid: false, message: '验证码不属于当前用户' };
+            if (verification.status !== 'valid' || !verification.data) {
+                return { valid: false, message: '验证验证码时发生错误' };
             }
 
-            // 验证成功后删除验证码
-            await redisClient.delete(codeKey);
+            const storedData = verification.data;
 
             logger.info(`[unified-auth] 用户 ${storedData.userId} 邮件验证码验证成功，目的: ${storedData.purpose}`);
             return {
@@ -325,7 +345,7 @@ export class UnifiedAuthService {
                     if (!codeId || !code) {
                         return { success: false, message: '请提供验证码ID和验证码' };
                     }
-                    authResult = await this.verifyEmailCode(codeId, code, userId);
+                    authResult = await this.verifyEmailCode(codeId, code, purpose, userId);
 
                     if (authResult.valid) {
                         // 如果是登录目的，需要获取完整用户信息

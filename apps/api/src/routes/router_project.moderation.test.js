@@ -8,6 +8,11 @@ const router = { use(handler) { guards.push(handler); } };
 for (const method of ["get", "post", "put", "delete"]) router[method] = (path, ...handlers) => routes.push({ method, path, handlers });
 const noop = () => {};
 const pass = (_req, _res, next) => next();
+const requireResource = (resource, action, idParam, options = {}) => {
+  const handler = (_req, _res, next) => next();
+  handler.requirement = { resource, action, idParam, options };
+  return handler;
+};
 const argsMatch = (record, where) => Object.entries(where).every(([key, value]) => record[key] === value);
 
 mock.module("express", { namedExports: { Router: () => router } });
@@ -75,7 +80,7 @@ mock.module("../controllers/projectRecommendations.js", { namedExports: {
   getContextRecommendedProjects: noop, getRecommendedProjectsForUser: noop, getSimilarProjectsByProject: noop,
 } });
 mock.module("../middleware/auth.js", { namedExports: { needLogin: pass } });
-mock.module("../middleware/scope.js", { namedExports: { requireScope: () => pass, requireResource: () => pass } });
+mock.module("../middleware/scope.js", { namedExports: { requireScope: () => pass, requireResource } });
 mock.module("../services/auth/permissionManager.js", { namedExports: { hasProjectPermission: async () => true } });
 mock.module("../services/projectCollaborationService.js", { namedExports: { userCanActOnProject: async () => true } });
 mock.module("../controllers/users.js", { namedExports: { getUserByUsername: noop } });
@@ -95,6 +100,8 @@ mock.module("../services/moderation/restrictions.js", { namedExports: { assertCa
 } } });
 mock.module("../services/moderation/lifecycle.js", { namedExports: { softDeleteContent: noop, restoreContent: noop } });
 mock.module("../middleware/sudo.js", { namedExports: { requireSudo: pass } });
+const { scopeSatisfies } = await import("../services/auth/scopes.js");
+const { SYSTEM_ROLE_KEYS, SYSTEM_ROLE_PERMISSIONS } = await import("../services/auth/rolePermissions.js");
 await import("./router_project.js");
 
 async function download(sha256 = "file-a") {
@@ -250,7 +257,23 @@ test('failed object uploads cannot issue a file token or return a successful sav
   assert.equal(state.issuedTokens, 0);
 });
 
-test('cloud configuration uses a single canonical read after saving', async () => {
+test('cloud configuration requires management authorization and preserves canonical writes', async () => {
+  const route = routes.find(route => route.method === 'put' && route.path === '/id/:id/cloudconfig');
+  assert.deepEqual(route.handlers[1].requirement, {
+    resource: 'project', action: 'manage', idParam: 'id', options: {},
+  });
+  const requiredScope = `project:1:${route.handlers[1].requirement.action}`;
+  assert.equal(scopeSatisfies(SYSTEM_ROLE_PERMISSIONS[SYSTEM_ROLE_KEYS.PROJECT_EDITOR], requiredScope), false);
+  assert.equal(scopeSatisfies(SYSTEM_ROLE_PERMISSIONS[SYSTEM_ROLE_KEYS.PROJECT_MANAGER], requiredScope), true);
+
+  let advanced = false;
+  await route.handlers[2]({ params: { id: '1' }, body: {}, headers: {} }, {
+    locals: { userid: 2, authorization: { allowed: true, actorId: 2, principalId: 2 } },
+    status() { return this; }, json() { return this; },
+  }, () => { advanced = true; });
+  assert.equal(advanced, true);
+  assert.deepEqual(state.writes, [{ userId: 2, category: 'project', action: 'manage' }]);
+
   const result = await invokeRoute('put', '/id/:id/cloudconfig', { params: { id: '1' }, body: { anonymouswrite: true } });
   assert.equal(result.body.status, 'success');
   assert.equal(result.body.data[0].value, true);

@@ -1160,11 +1160,11 @@ router.get("/id/:id/cloudconfig", async (req, res, next) => {
   }
 });
 
-// 更新项目云变量匿名写入配置
-router.put("/id/:id/cloudconfig", needLogin, requireResource("project", "update", "id", { allowDelegation: true }), projectWriteGuard("update", projectIdFromRequest), async (req, res, next) => {
+// 更新项目云变量访问和历史配置（高风险设置，仅项目管理员可修改）
+router.put("/id/:id/cloudconfig", needLogin, requireResource("project", "manage", "id"), projectWriteGuard("manage", projectIdFromRequest), async (req, res, next) => {
   try {
     const projectId = Number(req.params.id);
-    // 权限已由 requireResource("project","update","id") 中间件校验（含协作者）。
+    // 权限已由 requireResource("project","manage","id") 中间件校验（作者或管理员协作者）。
     const project = await prisma.ow_projects.findFirst({
       where: { id: projectId },
       select: { id: true },

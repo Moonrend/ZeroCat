@@ -470,8 +470,14 @@ router.post('/ui/login', needLogin, requireScope("comment:create"), async (req, 
             avatar: user.avatar,
         });
 
-        // 生成 Waline JWT
-        const token = createWalineToken(userId, space.jwt_secret);
+        // 生成受父令牌权限、空间与短有效期约束的 Waline JWT
+        const token = await createWalineToken({
+            userId,
+            jwtSecret: space.jwt_secret,
+            spaceId: space.id,
+            spaceCuid: space.cuid,
+            parentTokenId: res.locals.tokenId,
+        });
 
         // 计算 mailMd5 (Gravatar)
         const mail = spaceUser.email || user.email || '';

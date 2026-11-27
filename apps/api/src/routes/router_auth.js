@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { parseToken, needLogin } from '../middleware/auth.js';
 import { scopeSatisfies } from '../services/auth/scopes.js';
 import { userSatisfiesPolicy } from '../services/auth/policyEngine.js';
+import { createRateLimit } from '../middleware/rateLimit.js';
 import {
     sendCode,
     auth,
@@ -9,6 +10,23 @@ import {
 } from '../controllers/auth/unifiedAuthController.js';
 
 const router = Router();
+
+const passwordResetLimiter = createRateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    prefix: 'rate_limit:password_reset:',
+    message: {
+        status: 'error',
+        message: '密码重置请求过于频繁，请稍后再试'
+    }
+});
+
+const limitPasswordReset = (req, res, next) => {
+    if (req.body?.purpose !== 'reset_password') {
+        return next();
+    }
+    return passwordResetLimiter(req, res, next);
+};
 
 const AUTHENTICATED_PURPOSE_SCOPES = {
     sudo: null,
@@ -73,7 +91,7 @@ router.get('/methods', getAuthMethods);
  * - purpose: 认证目的 (login, sudo, reset_password, change_email, delete_account)
  * - userId: 用户ID（某些场景下可选，会从登录状态获取）
  */
-router.post('/send-code', requirePurposeAuthorization, sendCode);
+router.post('/send-code', limitPasswordReset, requirePurposeAuthorization, sendCode);
 
 /**
  * POST /auth/authenticate
@@ -90,6 +108,6 @@ router.post('/send-code', requirePurposeAuthorization, sendCode);
  * - code: 验证码（email方式）
  * - new_password: 新密码（reset_password时必填）
  */
-router.post('/authenticate', requirePurposeAuthorization, auth);
+router.post('/authenticate', limitPasswordReset, requirePurposeAuthorization, auth);
 
 export default router;

@@ -7,6 +7,7 @@ import axios from 'axios';
 import logger from '../logger.js';
 import { AP_CONTENT_TYPE, AP_ACCEPT_TYPES } from './config.js';
 import { cacheRemoteActor, getCachedRemoteActor } from './store.js';
+import { getKeyDocumentUrl, validateActorKeyBinding, validateFetchedActorIdentity } from './identityBinding.js';
 
 // 远程 Actor 缓存 TTL (1小时)
 const ACTOR_CACHE_TTL = 60 * 60 * 1000;
@@ -26,7 +27,8 @@ export async function fetchRemoteActor(actorUrl, forceRefresh = false) {
         const cached = await getCachedRemoteActor(actorUrl);
         if (cached && cached._cachedAt) {
             const age = Date.now() - new Date(cached._cachedAt).getTime();
-            if (age < ACTOR_CACHE_TTL) {
+            const identity = validateFetchedActorIdentity(cached, actorUrl);
+            if (identity.valid && age < ACTOR_CACHE_TTL) {
                 return cached;
             }
         }
@@ -46,6 +48,12 @@ export async function fetchRemoteActor(actorUrl, forceRefresh = false) {
         const actor = response.data;
         if (!actor || !actor.id) {
             logger.warn(`[ap-federation] 来自 ${actorUrl} 的 actor 响应无效`);
+            return null;
+        }
+
+        const identity = validateFetchedActorIdentity(actor, actorUrl);
+        if (!identity.valid) {
+            logger.warn(`[ap-federation] 拒绝来自 ${actorUrl} 的 actor: ${identity.message}`);
             return null;
         }
 
@@ -90,11 +98,14 @@ export async function fetchPublicKeyByKeyId(keyId) {
     if (!keyId) return null;
 
     // keyId 通常是 actorUrl#main-key 格式
-    const actorUrl = keyId.split('#')[0];
+    const actorUrl = getKeyDocumentUrl(keyId);
+    if (!actorUrl) return null;
+
     const actor = await fetchRemoteActor(actorUrl, true); // 强制刷新以获取最新公钥
     if (!actor) return null;
 
-    return getPublicKeyFromActor(actor);
+    const binding = validateActorKeyBinding({ actor, keyId });
+    return binding.valid ? binding.publicKeyPem : null;
 }
 
 /**

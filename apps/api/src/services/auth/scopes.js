@@ -55,7 +55,7 @@ export const ACTION_DEFINITIONS = {
     },
 };
 
-export const ADMIN_MODULES = ["permissions", "restrictions", "content", "hidden_content"];
+export const ADMIN_MODULES = ["permissions", "restrictions", "content", "hidden_content", "analytics"];
 
 const ACTION_COVERAGE = {
     read: ["read"],
