@@ -116,6 +116,32 @@ class RedisService {
         }
     }
 
+    // Atomically read and remove a value. Security capabilities use this to
+    // guarantee that concurrent consumers cannot redeem the same value twice.
+    async getAndDelete(key) {
+        try {
+            if (!this.client || !this.isConnected) {
+                throw new Error('[redis] Redis未连接');
+            }
+
+            const value = await this.client.eval(
+                'local value = redis.call("GET", KEYS[1]); if value then redis.call("DEL", KEYS[1]); end; return value',
+                1,
+                key
+            );
+            if (!value) return null;
+
+            try {
+                return JSON.parse(value);
+            } catch {
+                return value;
+            }
+        } catch (error) {
+            logger.error(`[redis] Redis getAndDelete错误 [${key}]:`, error);
+            throw error;
+        }
+    }
+
     // 删除键
     async delete(key) {
         try {

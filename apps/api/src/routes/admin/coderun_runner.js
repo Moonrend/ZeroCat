@@ -5,44 +5,133 @@ import zcconfig from '../../services/config/zcconfig.js';
 import logger from '../../services/logger.js';
 import codeRunManager from '../../services/coderunManager.js';
 import {getValue} from '../../services/cachekv.js'
+import {needLogin} from '../../middleware/auth.js';
+import {authorize} from '../../services/auth/authorization.js';
+import {
+    CODERUN_CAPABILITY_TTL_SECONDS,
+    CODERUN_SUBPROTOCOL_PREFIX,
+    consumeCodeRunCapability,
+    issueCodeRunCapability,
+} from '../../services/coderunCapability.js';
 
 const router = Router();
 
-// Get active runners endpoint
-router.get('/getrunners', async (req, res) => {
+function normalizeRunnerUrl(value) {
     try {
-        const allRunners = codeRunManager.getAllRunners();
-        const activeRunners = [];
+        const url = new URL(value);
+        if (!['http:', 'https:'].includes(url.protocol)) return null;
+        url.username = '';
+        url.password = '';
+        url.pathname = '/';
+        url.search = '';
+        url.hash = '';
+        return url.toString();
+    } catch {
+        return null;
+    }
+}
 
-        // Get all runner devices to match with request URLs
-        const devices = await prisma.ow_coderun_devices.findMany({
-            where: {
-                status: 'active',
-                request_url: {
-                    not: ''
-                }
-            }
-        });
+async function getActiveRunners() {
+    const allRunners = codeRunManager.getAllRunners();
+    const devices = await prisma.ow_coderun_devices.findMany({
+        where: {status: 'active', request_url: {not: ''}},
+        orderBy: {created_at: 'asc'},
+        select: {id: true, device_name: true, request_url: true},
+    });
 
-        // Match active runners with their device info
-        for (const device of devices) {
-            const runnerStatus = allRunners[device.id];
-            if (runnerStatus && runnerStatus.status === 'active') {
-                activeRunners.push({
-                    id: device.id,
-                    device_name: device.device_name,
-                    request_url: device.request_url,
-                });
-            }
-        }
+    return devices.flatMap((device) => {
+        const requestUrl = normalizeRunnerUrl(device.request_url);
+        const runnerStatus = allRunners[device.id];
+        if (!requestUrl || !runnerStatus || runnerStatus.status !== 'active') return [];
+        return [{id: device.id, device_name: device.device_name, request_url: requestUrl}];
+    });
+}
 
+// Get active runners endpoint
+router.get('/getrunners', needLogin, async (req, res) => {
+    try {
         res.json({
             success: true,
-            runners: activeRunners
+            runners: await getActiveRunners()
         });
     } catch (error) {
         console.error('Error getting active runners:', error);
         res.status(500).json({success: false, error: 'Internal server error'});
+    }
+});
+
+// Create a short-lived terminal capability using the caller's normal API session.
+router.post('/session', needLogin, async (req, res) => {
+    try {
+        let projectId = null;
+        if (req.body?.project_id !== null && req.body?.project_id !== undefined) {
+            projectId = Number(req.body.project_id);
+            if (!Number.isInteger(projectId) || projectId <= 0) {
+                return res.status(400).json({success: false, error: 'Invalid project id'});
+            }
+        }
+
+        const authorization = await authorize({
+            userId: res.locals.userid,
+            requiredScope: projectId ? `project:${projectId}:read` : 'project:read',
+            tokenType: res.locals.tokenType,
+            tokenScopes: res.locals.scopes || [],
+        });
+        if (!authorization.allowed) {
+            return res.status(authorization.status).json({
+                success: false,
+                error: authorization.message,
+                code: authorization.code,
+            });
+        }
+
+        const [runner] = await getActiveRunners();
+        if (!runner) {
+            return res.status(503).json({success: false, error: 'No runner available'});
+        }
+
+        const {capability, record} = await issueCodeRunCapability({
+            runnerId: runner.id,
+            userId: res.locals.userid,
+            projectId,
+        });
+        res.status(201).json({
+            success: true,
+            runner,
+            capability,
+            expires_at: record.expires_at,
+            session_id: record.session_id,
+        });
+    } catch (error) {
+        logger.error('Error creating CodeRun session:', error);
+        res.status(503).json({success: false, error: 'Unable to create terminal session'});
+    }
+});
+
+// Runner-only, one-time capability redemption for the terminal handshake.
+router.post('/session/introspect', async (req, res) => {
+    try {
+        const runnerToken = req.headers.runner_token;
+        if (typeof runnerToken !== 'string' || !runnerToken.trim()) {
+            return res.status(401).json({success: false, error: 'Invalid runner token'});
+        }
+        const device = await prisma.ow_coderun_devices.findFirst({
+            where: {runner_token: runnerToken, status: 'active'},
+            select: {id: true},
+        });
+        if (!device) {
+            return res.status(401).json({success: false, error: 'Invalid runner token'});
+        }
+
+        const session = await consumeCodeRunCapability(req.body?.capability, device.id);
+        if (!session) {
+            return res.status(401).json({success: false, error: 'Invalid or expired capability'});
+        }
+
+        res.json({success: true, active: true, session});
+    } catch (error) {
+        logger.error('Error introspecting CodeRun capability:', error);
+        res.status(503).json({success: false, error: 'Unable to validate capability'});
     }
 });
 
@@ -53,8 +142,6 @@ router.post('/register', async (req, res) => {
 
         // Verify auth token matches config
         const configAuthToken = await zcconfig.get('coderun.authtoken');
-        logger.debug(`configAuthToken: ${configAuthToken}`);
-        logger.debug(`auth_token: ${auth_token}`);
         if (!configAuthToken || auth_token !== configAuthToken) {
             return res.status(401).json({success: false, error: 'Invalid auth token'});
         }
@@ -90,6 +177,9 @@ router.post('/device', async (req, res) => {
     try {
         const {docker, system, coderun} = req.body;
         const {runner_token} = req.headers;
+        if (typeof runner_token !== 'string' || !runner_token.trim()) {
+            return res.status(401).json({success: false, error: 'Invalid runner token'});
+        }
 
         // Verify runner token
         const device = await prisma.ow_coderun_devices.findFirst({
@@ -116,6 +206,9 @@ router.post('/device', async (req, res) => {
 router.get('/config', async (req, res) => {
     try {
         const {runner_token} = req.headers;
+        if (typeof runner_token !== 'string' || !runner_token.trim()) {
+            return res.status(401).json({success: false, error: 'Invalid runner token'});
+        }
 
         // Verify runner token
         const device = await prisma.ow_coderun_devices.findFirst({
@@ -133,15 +226,25 @@ router.get('/config', async (req, res) => {
             enabled: await zcconfig.get('coderun.enabled', true),
             poolSize: await zcconfig.get('coderun.pool_size', 5),
             reportInterval: await zcconfig.get('coderun.report_interval'),
-            jwtSecret: await zcconfig.get('security.jwttoken'),
             cloudconfig: await getValue(1, `coderun.cloudconfig`) || {}
         };
 
         // Merge with device-specific config
         const config = {
             ...defaultConfig,
-            ...(device.device_config || {})
+            ...(device.device_config || {}),
+            terminalAuth: {
+                type: 'one-time-capability',
+                transport: 'websocket-subprotocol',
+                subprotocolPrefix: CODERUN_SUBPROTOCOL_PREFIX,
+                introspectionPath: '/coderun/session/introspect',
+                expiresIn: CODERUN_CAPABILITY_TTL_SECONDS,
+                terminationMessageType: 'terminal.terminate',
+            },
         };
+        // Never expose API authorization signing material to runner devices,
+        // including values left in legacy device-specific configuration.
+        delete config.jwtSecret;
 
         res.json({success: true, config});
     } catch (error) {

@@ -88,6 +88,7 @@
       :auto-run="false"
       :code="code"
       :language="selectedLanguage"
+      :project-id="projectId"
     ></CodeRunTerminal>
   </div>
 </template>
@@ -115,6 +116,10 @@ export default {
     initialCode: {
       type: String,
       default: ''
+    },
+    projectId: {
+      type: [Number, String],
+      default: null
     },
   },
 

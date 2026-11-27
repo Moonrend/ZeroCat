@@ -43,6 +43,9 @@ const TARGET_CONFIG_TYPE_PROJECT = "project";
 const TARGET_CONFIG_KEY_CLOUD_ANON_WRITE = "scratch.clouddata.anonymouswrite";
 const TARGET_CONFIG_KEY_CLOUD_HISTORY_ENABLED = "scratch.clouddata.history.enabled";
 const CLOUD_CONFIG_CACHE_TTL_SECONDS = 604800;
+const PROJECT_CAPABILITY_TYPE = "project";
+const PROJECT_CAPABILITY_ACTION = "read";
+const PROJECT_CAPABILITY_AUDIENCE = "scratch-project-source";
 
 const cloudVarsRedisKey = (projectId) => `scratch:cloud:${projectId}:vars`;
 const cloudSnapshotDbKey = (projectId) => `scratch:cloud:${projectId}:vars`;
@@ -628,23 +631,20 @@ router.get("/projectinfo2", async function (req, res, next) {
         }), res.locals.userid) || {};
         res.locals.is_author = result.authorid == res.locals.userid;
         logger.debug(result);
-        var project_token = jsonwebtoken.sign(
-            {
-                exp: Math.floor(Date.now() / 1000) + 60 * 5,
-                data: {
-                    type: "project",
-                    action: "read",
-                    issuer: await zcconfig.get("site.domain"),
-                    projectid: result.id,
-                    userid: res.locals.userid,
-                    authorizationContext: {
-                        tokenType: res.locals.tokenType,
-                        tokenScopes: res.locals.scopes || [],
-                    },
-                },
+        const capabilityIssuer = await zcconfig.get("site.domain");
+        var project_token = jsonwebtoken.sign({
+            type: PROJECT_CAPABILITY_TYPE,
+            data: {
+                action: PROJECT_CAPABILITY_ACTION,
+                projectid: result.id,
+                viewerid: res.locals.userid ?? null,
             },
-            await zcconfig.get("security.jwttoken")
-        );
+        }, await zcconfig.get("security.jwttoken"), {
+            algorithm: "HS256",
+            audience: PROJECT_CAPABILITY_AUDIENCE,
+            issuer: capabilityIssuer,
+            expiresIn: 60 * 5,
+        });
         var jsonscratch = {
             id: result.id,
             title: result.title,
@@ -711,15 +711,22 @@ router.get("/projectinfo2", async function (req, res, next) {
 // 获取源代码
 router.get("/project/:id", async (req, res, next) => {
     try {
-        if (!req.params.id) {
+        const projectId = Number(req.params.id);
+        if (!Number.isInteger(projectId) || projectId <= 0) {
             return res.status(400).send({status: "error", message: "缺少项目ID"});
         }
         let project_token;
         if (req.query.token) {
             try {
+                const capabilityIssuer = await zcconfig.get("site.domain");
                 project_token = jsonwebtoken.verify(
                     req.query.token,
-                    await zcconfig.get("security.jwttoken")
+                    await zcconfig.get("security.jwttoken"),
+                    {
+                        algorithms: ["HS256"],
+                        audience: PROJECT_CAPABILITY_AUDIENCE,
+                        issuer: capabilityIssuer,
+                    }
                 );
             } catch (err) {
                 logger.debug("Error verifying project token:", err);
@@ -731,18 +738,16 @@ router.get("/project/:id", async (req, res, next) => {
                         code: "AUTH_ERROR_LOGIN",
                     });
             }
-            if (project_token.data.projectid != req.params.id) {
+            const tokenData = project_token?.data;
+            const currentViewerId = res.locals.userid ?? null;
+            if (
+                project_token?.type !== PROJECT_CAPABILITY_TYPE ||
+                tokenData?.action !== PROJECT_CAPABILITY_ACTION ||
+                tokenData?.projectid !== projectId ||
+                !Object.hasOwn(tokenData || {}, "viewerid") ||
+                (tokenData?.viewerid ?? null) !== currentViewerId
+            ) {
                 logger.debug("1");
-                return res
-                    .status(200)
-                    .send({
-                        status: "error",
-                        message: "无权访问此项目",
-                        code: "AUTH_ERROR_LOGIN",
-                    });
-            }
-            if (res.locals.userid && project_token.data.userid != res.locals.userid) {
-                logger.debug("2");
                 return res
                     .status(200)
                     .send({
@@ -762,17 +767,15 @@ router.get("/project/:id", async (req, res, next) => {
                 });
         }
         const project = await prisma.ow_projects.findFirst({
-            where: {id: Number(project_token.data.projectid)},
+            where: {id: projectId},
         });
 
-        const viewerId = res.locals.userid || project_token.data.userid;
-        const context = project_token.data.authorizationContext;
-        if (!await scratchProjectVisible(project, { locals: { ...res.locals, userid: viewerId } }, context)) {
+        if (!await scratchProjectVisible(project, res)) {
             return res.status(404).send({status: 'error', message: '作品不存在或无权打开'});
         }
 
         const source =
-            project.authorid === project_token.data.userid
+            project.authorid === res.locals.userid
                 ? project.devsource
                 : project.source;
         const projectFile = await getProjectFile(source);

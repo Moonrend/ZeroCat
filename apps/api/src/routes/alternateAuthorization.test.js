@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 const state = {};
 const noop = () => {};
 mock.module('../services/logger.js', { defaultExport: { info: noop, warn: noop, error: noop, debug: noop } });
-mock.module('../services/config/zcconfig.js', { defaultExport: { get: async () => '' } });
+mock.module('../services/config/zcconfig.js', { defaultExport: { get: async key => key === 'site.domain' ? 'https://zerocat.example' : 'jwt-secret' } });
 mock.module('../middleware/auth.js', { namedExports: { needLogin: noop } });
 mock.module('../middleware/scope.js', { namedExports: { requireResource: () => noop, requireScope: () => noop } });
 mock.module('../services/global.js', { namedExports: { S3update: noop } });
@@ -17,12 +17,15 @@ mock.module('../services/projectFileStorage.js', { namedExports: {
 mock.module('../services/extensionReview.js', { namedExports: { setReviewStatus: noop, isAutoApproveUser: async () => false } });
 mock.module('../controllers/projects.js', { namedExports: {
     getProjectById: async () => state.project,
-    getProjectFile: async () => { state.fileReads++; return { source: 'private source' }; },
+    getProjectFile: async source => { state.fileReads++; state.readSources.push(source); return { source: 'project source' }; },
 } });
 mock.module('../services/assets.js', { namedExports: Object.fromEntries([
     'validateFileTypeFromContent', 'uploadFile', 'handleAssetUpload', 'processImage', 'generateMD5', 'uploadToS3',
 ].map(name => [name, noop])) });
-mock.module('jsonwebtoken', { defaultExport: { verify: () => state.signedToken, sign: () => 'signed' } });
+mock.module('jsonwebtoken', { defaultExport: {
+    verify: (_token, _secret, options) => { state.verifyOptions = options; return state.signedToken; },
+    sign: (payload, _secret, options) => { state.signedPayload = payload; state.signOptions = options; return 'signed'; },
+} });
 const { scopeSatisfies } = await import('../services/auth/scopes.js');
 mock.module('../services/auth/authorization.js', { namedExports: { authorize: async context => {
     state.authorizations.push(context);
@@ -39,8 +42,11 @@ mock.module('../services/prisma.js', { namedExports: { prisma: {
     $queryRaw: async (_sql, ...values) => values.includes('tip') ? [{ id: 'tip', parent_commit_id: null, commit_file: 'file' }] : [],
     ow_projects: { findFirst: async () => state.project,
         findMany: async () => { state.sampleReads++; return state.visibleSamples; } },
-    ow_users: { findMany: async ({ where }) => where.AND?.some(filter => filter.hidden_profile)
-        ? [] : [{ id: 3, username: 'hidden-profile' }] },
+    ow_users: {
+        findFirst: async () => ({ id: 9, display_name: 'author', username: 'author', bio: '', avatar: '', createdAt: new Date(0) }),
+        findMany: async ({ where }) => where.AND?.some(filter => filter.hidden_profile)
+            ? [] : [{ id: 3, username: 'hidden-profile' }],
+    },
     ow_target_configs: { findMany: async () => [] },
     ow_events: { findMany: async () => [{ id: 1, actor_id: 3, event_data: { user: 'old-hidden-profile', value: '5' } }] },
     project_clouddata_history: { findMany: async () => [{ id: 1, actor_id: 3, actor_name: 'old-hidden-profile', value: '5' }] },
@@ -65,10 +71,12 @@ function response(locals = {}) {
 }
 const next = error => { if (error) throw error; };
 beforeEach(() => {
+    global.config = { 's3.staticurl': 'https://static.example' };
     const project = { id: 7, authorid: 9, state: 'public', type: 'scratch', default_branch: 'main', source: 'public-file', devsource: 'private-file' };
     Object.assign(state, { project, hidden: false, hiddenProfile: false, denied: false, fileReads: 0, extensionReads: 0, authorizations: [],
-        sampleReads: 0, profileBatches: 0, visibleSamples: [], extensionRows: [],
-        signedToken: { data: { projectid: 7, userid: 3, authorizationContext: { tokenType: 'session', tokenScopes: [] } } },
+        sampleReads: 0, profileBatches: 0, visibleSamples: [], extensionRows: [], readSources: [],
+        signedPayload: null, signOptions: null, verifyOptions: null,
+        signedToken: { type: 'project', data: { action: 'read', projectid: 7, viewerid: 3 } },
         extension: { id: 5, status: 'verified', projectid: 7, branch: 'main', commit: 'tip', project },
     });
 });
@@ -88,15 +96,64 @@ test('a signed Scratch project token cannot widen the current caller token ceili
     assert.equal(state.authorizations[0].tokenType, 'oauth');
 });
 
-test('signed Scratch project access without a current login still preserves its original token ceiling', async () => {
-    state.signedToken.data.authorizationContext = { tokenType: 'oauth', tokenScopes: ['user:read'] };
+test('a signed Scratch project token cannot supply the request principal', async () => {
     const res = response({});
     await handler(scratch, '/project/:id')({ params: { id: '7' }, query: { token: 'signed' } }, res, next);
-    assert.equal(res.statusCode, 404);
+    assert.equal(res.body.code, 'AUTH_ERROR_LOGIN');
+    assert.equal(state.fileReads, 0);
+    assert.equal(state.authorizations.length, 0);
+});
+
+test('Scratch project capabilities are typed without authorization snapshots', async () => {
+    const res = response({ userid: 9, tokenType: 'session', scopes: ['project:7:read'] });
+    await handler(scratch, '/projectinfo2')({ query: { id: '7' } }, res, next);
+    assert.deepEqual(state.signedPayload, {
+        type: 'project',
+        data: { action: 'read', projectid: 7, viewerid: 9 },
+    });
+    assert.deepEqual(state.signOptions, {
+        algorithm: 'HS256', audience: 'scratch-project-source', issuer: 'https://zerocat.example', expiresIn: 300,
+    });
+    assert.equal(res.body.project_token, 'signed');
+});
+
+test('authenticated project owners retain development source access', async () => {
+    state.signedToken.data.viewerid = 9;
+    const res = response({ userid: 9, tokenType: 'session', scopes: [] });
+    await handler(scratch, '/project/:id')({ params: { id: '7' }, query: { token: 'signed' } }, res, next);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(state.readSources, ['private-file']);
+    assert.deepEqual(state.verifyOptions, {
+        algorithms: ['HS256'], audience: 'scratch-project-source', issuer: 'https://zerocat.example',
+    });
+});
+
+test('anonymous project capabilities retain public source access', async () => {
+    state.signedToken.data.viewerid = null;
+    const res = response({});
+    await handler(scratch, '/project/:id')({ params: { id: '7' }, query: { token: 'signed' } }, res, next);
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(state.readSources, ['public-file']);
+});
+
+test('wrong project capability type, action, and missing viewer binding are rejected', async () => {
+    const res = response({ userid: 3, tokenType: 'session', scopes: [] });
+    state.signedToken.type = 'file';
+    await handler(scratch, '/project/:id')({ params: { id: '7' }, query: { token: 'signed' } }, res, next);
+    assert.equal(res.body.code, 'AUTH_ERROR_LOGIN');
+    state.signedToken.type = 'project';
+    state.signedToken.data.action = 'write';
+    await handler(scratch, '/project/:id')({ params: { id: '7' }, query: { token: 'signed' } }, res, next);
+    assert.equal(res.body.code, 'AUTH_ERROR_LOGIN');
+    state.signedToken.data.action = 'read';
+    delete state.signedToken.data.viewerid;
+    await handler(scratch, '/project/:id')({ params: { id: '7' }, query: { token: 'signed' } }, res, next);
+    assert.equal(res.body.code, 'AUTH_ERROR_LOGIN');
     assert.equal(state.fileReads, 0);
 });
 
 test('Scratch source download rechecks current moderation rather than trusting a signed snapshot', async () => {
+    state.signedToken.data.viewerid = null;
     state.hidden = true;
     const res = response({});
     await handler(scratch, '/project/:id')({ params: { id: '7' }, query: { token: 'signed' } }, res, next);

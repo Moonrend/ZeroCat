@@ -52,7 +52,7 @@ import {FitAddon} from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import programmingLanguages from '@/constants/programming_languages.js'
 import axios from '@/axios/axios'
-import {localuser} from '@/services/localAccount'
+import {createCodeRunWebSocketOptions} from '@/services/codeRunConnection.js'
 
 export default {
   name: 'CodeRunTerminal',
@@ -70,6 +70,10 @@ export default {
     autoRun: {
       type: Boolean,
       default: false
+    },
+    projectId: {
+      type: [Number, String],
+      default: null
     }
   },
 
@@ -82,14 +86,13 @@ export default {
       sessionStartTime: null,
       sessionTimer: null,
       sessionTime: '',
-      selectedRunner: null
+      session: null
     }
   },
 
   async mounted() {
     await this.initializeTerminal()
-    await this.fetchRunners()
-    this.connect()
+    await this.connect()
 
     window.addEventListener('resize', this.handleResize)
   },
@@ -100,19 +103,6 @@ export default {
   },
 
   methods: {
-    async fetchRunners() {
-      try {
-        const response = await axios.get('/coderun/getrunners')
-        const data = response.data
-
-        if (data.success && data.runners.length > 0) {
-          this.selectedRunner = data.runners[0]
-        }
-      } catch (error) {
-        console.error('Failed to fetch runners:', error)
-      }
-    },
-
     async initializeTerminal() {
       this.term = new Terminal({
         cursorBlink: true,
@@ -137,21 +127,33 @@ export default {
       }
     },
 
-    connect() {
-      if (!this.selectedRunner) {
-        this.term.write('\r\n[Error] No runner available\r\n')
-        return
-      }
-
+    async connect() {
       if (this.ws) {
         this.ws.close()
+        this.ws = null
       }
 
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = new URL('/terminal?token=' + localuser.getToken(), this.selectedRunner.request_url)
-      wsUrl.protocol = wsProtocol
+      try {
+        const response = await axios.post('/coderun/session', {
+          project_id: this.projectId
+        })
+        const data = response.data
+        if (!data.success || !data.runner || !data.capability) {
+          throw new Error('No runner available')
+        }
 
-      this.ws = new WebSocket(wsUrl.toString())
+        this.session = data
+        const connection = createCodeRunWebSocketOptions(
+          data.runner.request_url,
+          data.capability,
+          window.location.protocol
+        )
+        this.ws = new WebSocket(connection.url, connection.protocol)
+      } catch (error) {
+        console.error('Failed to create CodeRun session:', error)
+        this.term.write('\r\n[Error] Unable to create terminal session\r\n')
+        return
+      }
 
       this.ws.onopen = () => {
         this.connected = true
@@ -167,6 +169,7 @@ export default {
 
       this.ws.onclose = () => {
         this.connected = false
+        this.ws = null
         this.term.write('\r\n[ZeroCat CodeRun] ❌ Disconnected\r\n')
         this.cleanup()
       }
@@ -189,16 +192,14 @@ export default {
 
     async terminateSession() {
       try {
-        if (this.selectedRunner) {//配置cors
-          const response = await axios.post(`${this.selectedRunner.request_url}/terminal/terminate`)
-
-          if (response.code !== 200) {
-            throw new Error('Failed to terminate session')
-          }
-        }
-
         if (this.ws) {
-          this.ws.close()
+          if (this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+              type: 'terminal.terminate',
+              session_id: this.session?.session_id
+            }))
+          }
+          this.ws.close(1000, 'User terminated session')
         }
       } catch (error) {
         console.error('Failed to terminate session:', error)

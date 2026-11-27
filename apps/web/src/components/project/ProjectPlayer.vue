@@ -38,6 +38,7 @@
         ref="codeRunner"
         :initial-code="projectCode"
         :initial-language="projectLanguage"
+        :project-id="projectId"
         :project-type="projectType"
       ></CodeRunner>
     </template>

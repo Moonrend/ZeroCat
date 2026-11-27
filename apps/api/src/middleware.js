@@ -174,29 +174,11 @@ export async function configureMiddleware(app) {
         // 1. Authorization header (Bearer token)
         // 2. Query parameter 'token'
         // 3. Cookie 'token'
-        let token = null;
-
-        // 检查Authorization header
-        const authHeader = req.headers["authorization"];
-        if (authHeader) {
-            // 支持"Bearer token"格式或直接提供token
-            const parts = authHeader.split(" ");
-            if (parts.length === 2 && parts[0].toLowerCase() === "bearer") {
-                token = parts[1];
-            } else {
-                token = authHeader;
-            }
-        }
-
-        // 如果header中没有token，检查query参数
-        if (!token && req.query.token) {
-            token = req.query.token;
-        }
-
-        // 如果query中没有token，检查cookies
-        if (!token && req.cookies && req.cookies.token) {
-            token = req.cookies.token;
-        }
+        // Scratch project-source queries carry a capability rather than an
+        // authentication token, so retain any server-verified cookie principal.
+        const token = extractTokenFromRequest(req, {
+            preferCookie: req.path.startsWith("/scratch/project/"),
+        });
 
         if (!token) {
             // 没有令牌，继续处理请求但不设置用户信息
@@ -231,9 +213,10 @@ export async function configureMiddleware(app) {
 /**
  * 从请求中提取token
  * @param {express.Request} req
+ * @param {{preferCookie?: boolean}} options
  * @returns {string|null}
  */
-export function extractTokenFromRequest(req) {
+export function extractTokenFromRequest(req, {preferCookie = false} = {}) {
     let token = null;
 
     // 检查Authorization header
@@ -246,6 +229,12 @@ export function extractTokenFromRequest(req) {
         } else {
             token = authHeader;
         }
+    }
+
+    // Capability-style routes must preserve an independently authenticated
+    // browser principal instead of treating the query capability as identity.
+    if (!token && preferCookie && req.cookies && req.cookies.token) {
+        token = req.cookies.token;
     }
 
     // 如果header中没有token，检查query参数
