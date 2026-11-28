@@ -695,7 +695,6 @@ async function resolveExternalFromOriginalEmbed(embed, frontend) {
             uri: String(embed.url),
             title: shortText(String(embed.title || embed.url), 100),
             description: shortText(String(embed.description || ''), 300),
-            thumbUrl: String(embed.thumbnail || '').trim() || null,
         };
     }
 

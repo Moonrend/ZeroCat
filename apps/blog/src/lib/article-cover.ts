@@ -1,29 +1,24 @@
-export type ArticleCoverInput = {
-  title: string;
-  summary?: string | null;
-  content?: string | null;
-  slug?: string | null;
-};
+import {
+  compactArticleCoverPayload,
+  type ArticleCoverInput,
+} from "./article-cover-contract";
 
-function normalizePayload(input: ArticleCoverInput) {
-  return {
-    title: (input.title || "未命名文章").trim(),
-    summary: input.summary || "",
-    content: input.content || "",
-    slug: (input.slug || "zerocat-blog").trim(),
-  };
-}
+export type { ArticleCoverInput } from "./article-cover-contract";
 
 export async function generateArticleCoverDataUrl(
   input: ArticleCoverInput,
+  token: string,
   signal?: AbortSignal
 ) {
+  if (!token.trim()) throw new Error("未登录");
+
   const response = await fetch("/api/covers/render", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify(normalizePayload(input)),
+    body: JSON.stringify(compactArticleCoverPayload(input)),
     cache: "no-store",
     signal,
   });

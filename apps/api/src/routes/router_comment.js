@@ -4,7 +4,7 @@ import logger from '../services/logger.js';
 import zcconfig from '../services/config/zcconfig.js';
 import { prisma } from '../services/prisma.js';
 import { walineSpaceResolver, isSpaceAdmin } from '../middleware/walineSpaceResolver.js';
-import { createWalineToken } from '../services/commentService/walineAuth.js';
+import { isWalineScopeGranted, revokeWalineToken } from '../services/commentService/walineAuth.js';
 import {
     getOrCreateSpaceUser,
     getSpaceUser,
@@ -64,6 +64,15 @@ function parseWalineListParam(input, { preserveEmpty = false } = {}) {
     return result;
 }
 
+function hasWalineScope(req, requiredScope) {
+    return Boolean(req.walineUser)
+        && isWalineScopeGranted(req.walineUser.scopes, requiredScope);
+}
+
+function walineScopeDenied(res) {
+    return res.status(403).json({ errno: 1003, errmsg: '令牌权限不足' });
+}
+
 // Waline 示例页面 (在 walineSpaceResolver 之前，跳过域名校验)
 router.get('/:spaceCuid', (req, res, next) => {
     // 仅当浏览器直接访问时返回 HTML；API 请求放行到后续路由
@@ -120,6 +129,7 @@ router.get('/:spaceCuid/api/comment', async (req, res, next) => {
         const space = req.commentSpace;
         const config = req.spaceConfig;
         const { type } = req.query;
+        const canReadAsUser = hasWalineScope(req, 'comment:read');
 
         // type=count - 获取评论数量
         if (type === 'count') {
@@ -129,7 +139,7 @@ router.get('/:spaceCuid/api/comment', async (req, res, next) => {
                 space.id,
                 urls.length > 0 ? urls : null,
                 {
-                    userId: req.walineUser?.userId || null,
+                    userId: canReadAsUser ? req.walineUser.userId : null,
                     forceArray: hasUrlParam && urls.length > 0,
                 },
             );
@@ -139,7 +149,7 @@ router.get('/:spaceCuid/api/comment', async (req, res, next) => {
         // type=recent - 获取最新评论
         if (type === 'recent') {
             const data = await getRecentComments(space.id, req.query.count, config, {
-                userId: req.walineUser?.userId || null,
+                userId: canReadAsUser ? req.walineUser.userId : null,
                 isAdmin: isSpaceAdmin(req),
             });
             return res.json({ errno: 0, errmsg: '', data });
@@ -167,7 +177,7 @@ router.get('/:spaceCuid/api/comment', async (req, res, next) => {
         const data = await getComments(
             space.id,
             { url: pageUrl, ...req.query },
-            { isAdmin: admin, config, userId: req.walineUser?.userId || null },
+            { isAdmin: admin, config, userId: canReadAsUser ? req.walineUser.userId : null },
         );
         return res.json({ errno: 0, data });
     } catch (err) {
@@ -184,6 +194,10 @@ router.post('/:spaceCuid/api/comment', async (req, res, next) => {
         const space = req.commentSpace;
         const config = req.spaceConfig;
         const ip = req.ipInfo?.clientIP || req.ip;
+
+        if (req.walineUser && !hasWalineScope(req, 'comment:create')) {
+            return walineScopeDenied(res);
+        }
 
         // 检查 login=force
         if (config.login === 'force' && !req.walineUser) {
@@ -295,13 +309,19 @@ router.put('/:spaceCuid/api/comment/:id', async (req, res, next) => {
         if (!req.walineUser && !isLikeOnly) {
             return res.status(401).json({ errno: 1003, errmsg: '请先登录' });
         }
+        if (!isLikeOnly && !hasWalineScope(req, 'comment:update')) {
+            return walineScopeDenied(res);
+        }
 
         const admin = isSpaceAdmin(req);
+        const actingUserId = !isLikeOnly || hasWalineScope(req, 'comment:interact')
+            ? req.walineUser?.userId
+            : null;
         const updated = await updateComment(
             space.id,
             req.params.id,
             req.body,
-            req.walineUser?.userId,
+            actingUserId,
             admin,
         );
 
@@ -333,6 +353,9 @@ router.delete('/:spaceCuid/api/comment/:id', async (req, res, next) => {
         const space = req.commentSpace;
         if (!req.walineUser) {
             return res.status(401).json({ errno: 1003, errmsg: '请先登录' });
+        }
+        if (!hasWalineScope(req, 'comment:delete')) {
+            return walineScopeDenied(res);
         }
 
         const admin = isSpaceAdmin(req);
@@ -421,9 +444,14 @@ router.post('/:spaceCuid/api/token', async (req, res, next) => {
 
 /**
  * DELETE /comment/:spaceCuid/api/token
- * 登出 (no-op, 客户端清除即可)
+ * 登出并吊销当前派生令牌
  */
-router.delete('/:spaceCuid/api/token', (req, res) => {
+router.delete('/:spaceCuid/api/token', async (req, res, next) => {
+    try {
+        if (req.walineToken) await revokeWalineToken(req.walineToken);
+    } catch (err) {
+        return next(err);
+    }
     res.json({ errno: 0, errmsg: '' });
 });
 
@@ -481,6 +509,9 @@ router.put('/:spaceCuid/api/user', async (req, res, next) => {
     try {
         if (!req.walineUser) {
             return res.status(401).json({ errno: 1003, errmsg: '请先登录' });
+        }
+        if (!hasWalineScope(req, 'comment:update')) {
+            return walineScopeDenied(res);
         }
 
         const space = req.commentSpace;

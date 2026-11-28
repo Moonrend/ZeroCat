@@ -12,7 +12,10 @@ import {
     getSessionFromRefreshToken,
     issueToken,
 } from "../../services/auth/tokenService.js";
-import { userCanAccessResourceScope } from "../../services/auth/scopes.js";
+import {
+    tokenContextCanGrantScopes,
+    userCanAccessResourceScope,
+} from "../../services/auth/scopes.js";
 
 const EDITOR_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365;
 
@@ -29,7 +32,15 @@ async function getSessionFromRefreshTokenCandidates(refreshTokens, ipAddress) {
     return { session: null, refreshToken: null };
 }
 
-async function issueEditorTokenForUser({ userId, user = null, projectId, req, res }) {
+async function issueEditorTokenForUser({
+    userId,
+    user = null,
+    projectId,
+    tokenType,
+    tokenScopes = [],
+    req,
+    res,
+}) {
     const readScope = `project:${projectId}:read`;
     const updateScope = `project:${projectId}:update`;
     const manageScope = `project:${projectId}:manage`;
@@ -56,6 +67,17 @@ async function issueEditorTokenForUser({ userId, user = null, projectId, req, re
     }
     if (canManage) {
         scopes.push(manageScope);
+    }
+
+    if (!tokenContextCanGrantScopes(tokenType, tokenScopes, scopes)) {
+        return {
+            statusCode: 403,
+            payload: {
+                status: "error",
+                message: "当前令牌无权授予编辑器所需的权限",
+                code: "ZC_ERROR_SCOPE_ESCALATION",
+            },
+        };
     }
 
     const issued = await issueToken({
@@ -220,6 +242,8 @@ export const issueEditorSession = async (req, res) => {
             userId: session.userId,
             user: session.user,
             projectId,
+            tokenType: "session",
+            tokenScopes: [],
             req,
             res,
         });
@@ -266,6 +290,8 @@ export const issueEditorToken = async (req, res) => {
                 display_name: res.locals.display_name,
             },
             projectId,
+            tokenType: res.locals.tokenType,
+            tokenScopes: res.locals.scopes || [],
             req,
             res,
         });

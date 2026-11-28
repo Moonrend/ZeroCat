@@ -81,6 +81,12 @@ function validateEmbed(embed) {
     } catch (e) {
       throw new Error("无效的URL格式");
     }
+
+    // URL preview thumbnails are client-authored metadata. Keep them out of
+    // persisted embeds so background workers cannot treat them as fetch targets.
+    const safeEmbed = { ...embed };
+    delete safeEmbed.thumbnail;
+    return safeEmbed;
   }
 
   return embed;

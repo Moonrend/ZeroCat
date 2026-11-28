@@ -6,6 +6,7 @@ import cookieParser from 'cookie-parser';
 import logger from './services/logger.js';
 import zcconfig from './services/config/zcconfig.js';
 import ipMiddleware from './middleware/ipMiddleware.js';
+import { GLOBAL_BODY_LIMIT, shouldParseGlobalJson } from './middleware/requestBody.js';
 import { verifyToken as verifyUnifiedToken } from './services/auth/tokenService.js';
 
 const SENSITIVE_QUERY_KEYS = new Set([
@@ -151,16 +152,13 @@ export async function configureMiddleware(app) {
     );
 
     // 请求体解析
-    app.use(bodyParser.urlencoded({limit: "100mb", extended: false}));
+    app.use(bodyParser.urlencoded({limit: GLOBAL_BODY_LIMIT, extended: false}));
     app.use(bodyParser.json({
-        limit: "100mb",
-        verify: (req, _res, buf) => {
-            // 保留原始请求体字节，供 ActivityPub HTTP Signature / Digest 验证使用
-            req.rawBody = buf;
-        },
+        limit: GLOBAL_BODY_LIMIT,
+        type: shouldParseGlobalJson,
     }));
-    app.use(bodyParser.text({limit: "100mb"}));
-    app.use(bodyParser.raw({limit: "100mb"}));
+    app.use(bodyParser.text({limit: GLOBAL_BODY_LIMIT}));
+    app.use(bodyParser.raw({limit: GLOBAL_BODY_LIMIT}));
 
     // 压缩中间件
     app.use(compress());

@@ -138,6 +138,7 @@ model ow_users {
   oauth_access_tokens     ow_oauth_access_tokens[]
   kv_store                ow_cache_kv[]
   tokens                  ow_tokens[]             @relation("UserTokens")
+  comment_tokens          ow_comment_tokens[]     @relation("CommentTokenUser")
   uploaded_assets         ow_assets[]             @relation("AssetUploader")
   banned_assets           ow_assets[]             @relation("AssetBannedBy")
   push_subscriptions      ow_push_subscriptions[] @relation("UserPushSubscriptions")
@@ -993,6 +994,7 @@ model ow_tokens {
   user          ow_users?                @relation("UserTokens", fields: [user_id], references: [id], onDelete: SetNull, onUpdate: SetNull)
   application   ow_oauth_applications?   @relation(fields: [application_id], references: [id], onDelete: SetNull, onUpdate: SetNull)
   authorization ow_oauth_authorizations? @relation(fields: [authorization_id], references: [id], onDelete: SetNull, onUpdate: SetNull)
+  comment_tokens ow_comment_tokens[]      @relation("CommentTokenParent")
 
   @@index([token_hash])
   @@index([refresh_token_hash])
@@ -1246,10 +1248,35 @@ model ow_comment_spaces {
   comments    ow_comment_service[]
   users       ow_comment_service_users[]
   counters    ow_comment_service_counter[]
+  tokens      ow_comment_tokens[]
 
   @@index([owner_id])
   @@index([status])
   @@map("ow_comment_spaces")
+}
+
+// 短期 Waline 派生令牌；权限与生命周期始终受父 ZeroCat 令牌约束
+model ow_comment_tokens {
+  id              Int       @id @default(autoincrement())
+  jti             String    @unique @db.VarChar(32)
+  token_hash      String    @unique @db.VarChar(64)
+  user_id         Int
+  space_id        Int
+  parent_token_id Int
+  scopes          Json
+  expires_at      DateTime  @db.Timestamp(6)
+  revoked_at      DateTime? @db.Timestamp(6)
+  created_at      DateTime  @default(now()) @db.Timestamp(6)
+
+  user         ow_users          @relation("CommentTokenUser", fields: [user_id], references: [id], onDelete: Cascade)
+  space        ow_comment_spaces @relation(fields: [space_id], references: [id], onDelete: Cascade)
+  parent_token ow_tokens         @relation("CommentTokenParent", fields: [parent_token_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([space_id])
+  @@index([parent_token_id])
+  @@index([expires_at])
+  @@map("ow_comment_tokens")
 }
 
 // SaaS评论表

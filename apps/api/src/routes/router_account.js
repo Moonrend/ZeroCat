@@ -14,10 +14,7 @@ import {
     passkeyController
 } from "../controllers/auth/index.js";
 import {initializeOAuthProviders} from "../controllers/oauth.js";
-import {invalidateTemporaryToken, validateTemporaryToken} from "../services/auth/verification.js";
-import {prisma} from "../services/prisma.js";
 import logger from "../services/logger.js";
-import tokenUtils from "../services/auth/tokenUtils.js";
 import zcconfig from "../services/config/zcconfig.js";
 import { buildAtprotoAuthClientMetadata } from '../services/social/atprotoAuthOAuth.js';
 
@@ -97,140 +94,11 @@ router.get('/oauth/bluesky/client-metadata.json', async (req, res) => {
         res.status(500).json({ status: 'error', message: '生成Bluesky client metadata失败' });
     }
 });
+// 精确路由必须位于 /oauth/:provider 前，且仅从 HttpOnly Cookie 读取临时令牌。
+router.post("/oauth/validate-token", oauthController.validateOAuthLoginToken);
 router.get("/oauth/bind/:provider", needLogin, requireScope("user:update", { action: "security" }), oauthController.bindOAuth);
 router.get("/oauth/:provider", oauthController.authWithOAuth);
 router.get("/oauth/:provider/callback", oauthController.handleOAuthCallbackRequest);
-// 使用临时令牌验证并获取用户信息
-router.get("/oauth/validate-token/:token", async (req, res) => {
-    const {token} = req.params;
-
-    if (!token) {
-        logger.warn('请求中未提供令牌');
-        return res.status(400).json({
-            status: "error",
-            message: "未提供令牌"
-        });
-    }
-
-    logger.debug(`处理令牌验证请求: ${token.substring(0, 8)}...`);
-
-    try {
-        // 验证临时令牌
-        let tokenResult;
-        try {
-            tokenResult = await validateTemporaryToken(token, 'oauth_login');
-            logger.debug(`令牌验证结果: ${JSON.stringify({
-                success: tokenResult.success,
-                message: tokenResult.message || ''
-            })}`);
-        } catch (validationError) {
-            logger.error(`令牌验证函数抛出异常: ${validationError.message}`);
-            return res.status(500).json({
-                status: "error",
-                message: "令牌验证处理异常"
-            });
-        }
-
-        if (!tokenResult.success) {
-            logger.warn(`令牌验证失败: ${tokenResult.message}`);
-            return res.status(401).json({
-                status: "error",
-                message: tokenResult.message || "令牌验证失败"
-            });
-        }
-
-        // 从令牌数据中获取用户信息
-        if (!tokenResult.data || !tokenResult.data.userData) {
-            logger.error(`令牌数据中缺少userData字段: ${JSON.stringify(Object.keys(tokenResult.data || {}))}`);
-            return res.status(500).json({
-                status: "error",
-                message: "令牌数据格式错误"
-            });
-        }
-
-        const userData = tokenResult.data.userData;
-        logger.debug(`令牌验证成功，获取到用户数据: userId=${userData.userid}`);
-
-        // 生成正式的登录令牌
-        let user;
-        try {
-            user = await prisma.ow_users.findUnique({
-                where: {id: userData.userid}
-            });
-            logger.debug(`数据库用户查询结果: ${!!user}`);
-        } catch (dbError) {
-            logger.error(`查询用户数据库错误: ${dbError.message}`);
-            return res.status(500).json({
-                status: "error",
-                message: "查询用户信息失败"
-            });
-        }
-
-        if (!user) {
-            logger.error(`找不到令牌对应的用户: ${userData.userid}`);
-            return res.status(404).json({
-                status: "error",
-                message: "用户不存在"
-            });
-        }
-
-        // 使用新的令牌工具创建用户登录令牌
-        let loginTokenResult;
-        try {
-            // 标准化用户信息
-            const userInfo = await tokenUtils.getUserInfoForToken(user, userData.email);
-
-            // 创建令牌
-            loginTokenResult = await tokenUtils.createUserLoginTokens(
-                user.id,
-                userInfo,
-                req.ip,
-                req.headers['user-agent'],
-                {
-                    recordLoginEvent: true,
-                    loginMethod: 'oauth'
-                }
-            );
-
-            if (!loginTokenResult.success) {
-                logger.error(`创建登录令牌失败: ${loginTokenResult.message}`);
-                return res.status(500).json({
-                    status: "error",
-                    message: "创建登录令牌失败"
-                });
-            }
-
-            logger.debug(`登录令牌创建成功: tokenId=${loginTokenResult.tokenId}`);
-        } catch (tokenError) {
-            logger.error(`创建会话令牌失败: ${tokenError.message}`, tokenError);
-            logger.error(`错误堆栈: ${tokenError.stack}`);
-            return res.status(500).json({
-                status: "error",
-                message: "创建会话令牌失败"
-            });
-        }
-
-        // 令牌创建成功，立即使临时令牌失效
-        try {
-            await invalidateTemporaryToken(token);
-            logger.info(`用户 ${user.id} 使用OAuth临时令牌登录成功，临时令牌已失效`);
-        } catch (invalidateError) {
-            logger.warn(`临时令牌失效处理出错(非致命): ${invalidateError.message}`);
-            // 继续处理，不中断流程
-        }
-
-        // 生成登录响应
-        const response = tokenUtils.generateLoginResponse(user, loginTokenResult, userData.email);
-        return tokenUtils.respondWithBrowserAuthTokens(res, response);
-    } catch (error) {
-        logger.error(`处理令牌验证请求时出错: ${error.message}`, error);
-        logger.error(`错误堆栈: ${error.stack}`);
-        return res.status(500).json({
-            status: "error",
-            message: "令牌验证过程中发生错误"
-        });
-    }
-});
 router.post("/oauth/bound", needLogin, requireScope("user:read"), oauthController.getBoundOAuthAccounts);
 router.post("/unlink-oauth", needLogin, requireScope("user:update", { action: "security" }), requireSudo, oauthController.unlinkOAuth);
 

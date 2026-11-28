@@ -11,10 +11,140 @@ import {
 } from "../oauth.js";
 import {getAtprotoAuthAppStateByCallbackState} from "../../services/social/atprotoAuthOAuth.js";
 import zcconfig from "../../services/config/zcconfig.js";
-import {createTemporaryToken} from "../../services/auth/verification.js";
+import {
+    createTemporaryToken,
+    invalidateTemporaryToken,
+    validateTemporaryToken,
+} from "../../services/auth/verification.js";
+import tokenUtils from "../../services/auth/tokenUtils.js";
 
 const BLUESKY_SCOPE_LOGIN = 'atproto transition:email';
 const BLUESKY_SCOPE_BIND = 'atproto transition:generic transition:email';
+const OAUTH_TRANSACTION_TTL_SECONDS = 600;
+const OAUTH_TRANSACTION_COOKIE_PREFIX = 'oauth_transaction_';
+const OAUTH_LOGIN_TOKEN_COOKIE = 'oauth_login_token';
+const OAUTH_COOKIE_PATH = '/account/oauth';
+const OAUTH_LOGIN_TOKEN_PATH = '/account/oauth/validate-token';
+
+function isLocalHostname(hostname) {
+    const normalized = String(hostname || '').toLowerCase();
+    return !normalized || normalized === 'localhost' || normalized.endsWith('.localhost') ||
+        normalized === '::1' || normalized === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(normalized);
+}
+
+function isSecureCookieRequest(req) {
+    const hostname = req?.hostname || String(req?.headers?.host || '').split(':')[0];
+    // OAuth transactions require Secure cookies everywhere except explicit local development.
+    return !isLocalHostname(hostname);
+}
+
+function transactionCookieName(state) {
+    const stateDigest = crypto.createHash('sha256').update(String(state || '')).digest('hex');
+    return `${OAUTH_TRANSACTION_COOKIE_PREFIX}${stateDigest}`;
+}
+
+function hashBrowserBinding(value) {
+    return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function buildTransactionCookieOptions(req) {
+    return {
+        httpOnly: true,
+        secure: isSecureCookieRequest(req),
+        sameSite: 'lax',
+        path: OAUTH_COOKIE_PATH,
+    };
+}
+
+function buildLoginTokenCookieOptions(req) {
+    const secure = isSecureCookieRequest(req);
+    return {
+        httpOnly: true,
+        secure,
+        // Cross-site frontend deployments need None; same-site and local deployments use Lax.
+        sameSite: secure ? 'none' : 'lax',
+        path: OAUTH_LOGIN_TOKEN_PATH,
+    };
+}
+
+function createBrowserBoundTransaction(req, res, state) {
+    const browserBinding = crypto.randomBytes(32).toString('hex');
+    res.cookie(transactionCookieName(state), browserBinding, {
+        ...buildTransactionCookieOptions(req),
+        maxAge: OAUTH_TRANSACTION_TTL_SECONDS * 1000,
+    });
+    return hashBrowserBinding(browserBinding);
+}
+
+function clearBrowserBoundTransaction(req, res, state) {
+    res.clearCookie(transactionCookieName(state), buildTransactionCookieOptions(req));
+}
+
+function prepareBrowserBoundTransactionForRedemption(req, res, state) {
+    const cookieName = transactionCookieName(state);
+    const browserBinding = req.cookies?.[cookieName];
+    if (!browserBinding) return;
+
+    const secure = isSecureCookieRequest(req);
+    res.cookie(cookieName, browserBinding, {
+        ...buildTransactionCookieOptions(req),
+        // The frontend may be on another site and redeems through a credentialed request.
+        sameSite: secure ? 'none' : 'lax',
+        maxAge: OAUTH_TRANSACTION_TTL_SECONDS * 1000,
+    });
+}
+
+function hasBrowserBinding(req, state, expectedHash) {
+    if (!/^[a-f0-9]{64}$/.test(String(expectedHash || ''))) return false;
+
+    const browserBinding = req.cookies?.[transactionCookieName(state)];
+    if (typeof browserBinding !== 'string' || !browserBinding) return false;
+
+    const actual = Buffer.from(hashBrowserBinding(browserBinding), 'hex');
+    const expected = Buffer.from(expectedHash, 'hex');
+    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function hasValidOAuthTransaction(req, cachedState, state, provider) {
+    const flow = cachedState?.type === 'bind'
+        ? 'bind'
+        : cachedState?.type === 'login'
+            ? 'login'
+            : null;
+    const currentRedirectUri = String(OAUTH_PROVIDERS[provider]?.redirectUri || '');
+
+    return Boolean(
+        flow &&
+        cachedState?.flow === flow &&
+        cachedState?.provider === provider &&
+        cachedState?.redirectUri &&
+        cachedState.redirectUri === currentRedirectUri &&
+        hasBrowserBinding(req, state, cachedState.browserBindingHash)
+    );
+}
+
+function hasValidOAuthLoginRedemption(req, transaction) {
+    const provider = transaction?.provider;
+    const currentRedirectUri = String(OAUTH_PROVIDERS[provider]?.redirectUri || '');
+    return Boolean(
+        transaction?.flow === 'login' &&
+        transaction?.state &&
+        transaction?.redirectUri &&
+        transaction.redirectUri === currentRedirectUri &&
+        hasBrowserBinding(req, transaction.state, transaction.browserBindingHash)
+    );
+}
+
+function setOAuthLoginTokenCookie(req, res, token) {
+    res.cookie(OAUTH_LOGIN_TOKEN_COOKIE, token, {
+        ...buildLoginTokenCookieOptions(req),
+        maxAge: OAUTH_TRANSACTION_TTL_SECONDS * 1000,
+    });
+}
+
+function clearOAuthLoginTokenCookie(req, res) {
+    res.clearCookie(OAUTH_LOGIN_TOKEN_COOKIE, buildLoginTokenCookieOptions(req));
+}
 
 function resolveBlueskyScope(flow) {
     return flow === 'bind' ? BLUESKY_SCOPE_BIND : BLUESKY_SCOPE_LOGIN;
@@ -63,6 +193,7 @@ export const bindOAuth = async (req, res) => {
             ...(blueskyScope ? { scope: blueskyScope } : {}),
             ...(provider === 'bluesky' ? { flow: 'auth' } : {}),
         });
+        const browserBindingHash = createBrowserBoundTransaction(req, res, state);
 
         // 存储 state 与用户 ID 的映射，用于回调时识别绑定操作
         // 对 Bluesky：库会生成自己的内部 state，回调处理器通过 stateStore 解析出 appState 来查找此条目
@@ -70,6 +201,10 @@ export const bindOAuth = async (req, res) => {
             `oauth_state:${state}`,
             {
                 type: 'bind',
+                flow: 'bind',
+                provider,
+                redirectUri: OAUTH_PROVIDERS[provider].redirectUri,
+                browserBindingHash,
                 userId: res.locals.userid,
                 context: {
                     ...(identifier ? { identifier } : {}),
@@ -121,6 +256,7 @@ export const authWithOAuth = async (req, res) => {
             ...(blueskyScope ? { scope: blueskyScope } : {}),
             ...(provider === 'bluesky' ? { flow: 'auth' } : {}),
         });
+        const browserBindingHash = createBrowserBoundTransaction(req, res, state);
 
         // 存储 state 用于验证回调
         // 对 Bluesky：库会生成自己的内部 state，回调处理器通过 stateStore 解析出 appState 来查找此条目
@@ -128,6 +264,10 @@ export const authWithOAuth = async (req, res) => {
             `oauth_state:${state}`,
             {
                 type: 'login',
+                flow: 'login',
+                provider,
+                redirectUri: OAUTH_PROVIDERS[provider].redirectUri,
+                browserBindingHash,
                 context: {
                     tokenPurpose,
                     redirect,
@@ -217,7 +357,12 @@ export const handleOAuthCallbackRequest = async (req, res) => {
             }
 
             if (cachedStateForError) {
+                if (!hasValidOAuthTransaction(req, cachedStateForError, resolvedState, provider)) {
+                    logger.warn(`[oauthController] OAuth拒绝回调的事务绑定验证失败: provider=${provider}`);
+                    return redirectTo('/app/account/oauth/login/error', '无效的OAuth事务');
+                }
                 memoryCache.delete(`oauth_state:${resolvedState}`);
+                clearBrowserBoundTransaction(req, res, resolvedState);
                 const path = cachedStateForError.type === 'bind'
                     ? '/app/account/oauth/bind/error'
                     : '/app/account/oauth/login/error';
@@ -267,17 +412,20 @@ export const handleOAuthCallbackRequest = async (req, res) => {
             }
         }
 
-        if (!cachedState) {
-            logger.warn(`[oauthController] state验证失败: state=${state}, resolvedState=${resolvedState}`);
+        if (!cachedState || !hasValidOAuthTransaction(req, cachedState, resolvedState, provider)) {
+            logger.warn(`[oauthController] state或事务绑定验证失败: state=${state}, resolvedState=${resolvedState}, provider=${provider}`);
             return redirectTo('/app/account/oauth/login/error', '无效的state');
         }
+
+        // state 一次性消费；登录事务 Cookie 保留到前端兑换临时令牌时再次验证。
+        memoryCache.delete(`oauth_state:${resolvedState}`);
 
         // 根据 state 的类型处理不同的逻辑
         if (cachedState.type === "bind") {
             // ---- 身份绑定（创建/更新 oauth 联系方式，保存 auth 令牌）----
             const userIdToBind = cachedState.userId;
             logger.info(`[oauthController] 处理OAuth身份绑定回调: provider=${provider}, userId=${userIdToBind}`);
-            memoryCache.delete(`oauth_state:${resolvedState}`);
+            clearBrowserBoundTransaction(req, res, resolvedState);
 
             try {
                 const bindingResult = await handleOAuthCallback(
@@ -307,7 +455,6 @@ export const handleOAuthCallbackRequest = async (req, res) => {
         } else {
             // 登录/注册操作
             logger.info(`[oauthController] 处理OAuth登录/注册回调: provider=${provider}`);
-            memoryCache.delete(`oauth_state:${resolvedState}`);
 
             try {
                 const callbackResult = await handleOAuthCallback(
@@ -341,32 +488,50 @@ export const handleOAuthCallbackRequest = async (req, res) => {
                     // 创建临时令牌，用途为oauth_login
                     let tempToken;
                     try {
-                        const tokenResult = await createTemporaryToken(user.id, 'oauth_login', {userData});
+                        const oauthTransaction = {
+                            state: String(resolvedState),
+                            provider,
+                            flow: 'login',
+                            redirectUri: cachedState.redirectUri,
+                            browserBindingHash: cachedState.browserBindingHash,
+                        };
+                        const tokenResult = await createTemporaryToken(
+                            user.id,
+                            'oauth_login',
+                            {userData, oauthTransaction},
+                            OAUTH_TRANSACTION_TTL_SECONDS
+                        );
                         if (!tokenResult.success) {
                             logger.error(`[oauthController] 创建临时令牌失败: ${tokenResult.message}`);
+                            clearBrowserBoundTransaction(req, res, resolvedState);
                             return redirectTo('/app/account/oauth/login/error', '创建会话令牌失败');
                         }
                         tempToken = tokenResult.token;
                     } catch (tokenError) {
                         logger.error(`[oauthController] 创建临时令牌异常:`, tokenError);
+                        clearBrowserBoundTransaction(req, res, resolvedState);
                         return redirectTo('/app/account/oauth/login/error', '会话创建失败');
                     }
 
                     logger.info(`[oauthController] OAuth登录/注册成功: userId=${user.id}, username=${user.username}, provider=${provider}`);
 
-                    // 重定向到前端，并传递临时令牌和原始 redirect（如存在）
-                    let callbackUrl = `${frontendUrl}/app/account/oauth/callback?temp_token=${tempToken}`;
+                    // 临时令牌仅通过 HttpOnly Cookie 传递，不进入浏览器历史或回调 URL。
+                    prepareBrowserBoundTransactionForRedemption(req, res, resolvedState);
+                    setOAuthLoginTokenCookie(req, res, tempToken);
+                    let callbackUrl = `${frontendUrl}/app/account/oauth/callback`;
                     const savedRedirect = cachedState?.context?.redirect;
                     if (savedRedirect) {
-                        callbackUrl += `&redirect=${encodeURIComponent(savedRedirect)}`;
+                        callbackUrl += `?redirect=${encodeURIComponent(savedRedirect)}`;
                     }
                     return res.redirect(callbackUrl);
                 } else {
                     logger.error(`[oauthController] OAuth回调结果无效:`, callbackResult);
+                    clearBrowserBoundTransaction(req, res, resolvedState);
                     return redirectTo('/app/account/oauth/login/error', '登录失败: 无效的OAuth响应');
                 }
             } catch (error) {
                 logger.error(`[oauthController] OAuth登录/注册过程发生异常:`, error);
+                clearBrowserBoundTransaction(req, res, resolvedState);
                 const errorMsg = error.message || '登录失败';
                 return redirectTo('/app/account/oauth/login/error', 'OAuth登录失败: ' + errorMsg);
             }
@@ -384,6 +549,138 @@ export const handleOAuthCallbackRequest = async (req, res) => {
                 message: "OAuth处理失败"
             });
         }
+    }
+};
+
+/**
+ * 使用同一浏览器的 OAuth 事务 Cookie 兑换一次性登录令牌。
+ */
+export const validateOAuthLoginToken = async (req, res) => {
+    const token = req.cookies?.[OAUTH_LOGIN_TOKEN_COOKIE];
+
+    if (!token) {
+        logger.warn('OAuth登录请求中未提供临时令牌Cookie');
+        return res.status(400).json({
+            status: "error",
+            message: "未提供令牌"
+        });
+    }
+
+    try {
+        let tokenResult;
+        try {
+            tokenResult = await validateTemporaryToken(token, 'oauth_login');
+        } catch (validationError) {
+            logger.error(`OAuth临时令牌验证函数抛出异常: ${validationError.message}`);
+            return res.status(500).json({
+                status: "error",
+                message: "令牌验证处理异常"
+            });
+        }
+
+        if (!tokenResult.success) {
+            clearOAuthLoginTokenCookie(req, res);
+            logger.warn(`OAuth临时令牌验证失败: ${tokenResult.message}`);
+            return res.status(401).json({
+                status: "error",
+                message: tokenResult.message || "令牌验证失败"
+            });
+        }
+
+        const oauthTransaction = tokenResult.data?.oauthTransaction;
+        if (!hasValidOAuthLoginRedemption(req, oauthTransaction)) {
+            clearOAuthLoginTokenCookie(req, res);
+            if (oauthTransaction?.state) {
+                clearBrowserBoundTransaction(req, res, oauthTransaction.state);
+            }
+            logger.warn('OAuth临时令牌的浏览器事务绑定验证失败');
+            return res.status(401).json({
+                status: "error",
+                message: "无效的OAuth事务"
+            });
+        }
+
+        if (!tokenResult.data?.userData) {
+            clearOAuthLoginTokenCookie(req, res);
+            clearBrowserBoundTransaction(req, res, oauthTransaction.state);
+            logger.error('OAuth临时令牌数据中缺少userData字段');
+            return res.status(500).json({
+                status: "error",
+                message: "令牌数据格式错误"
+            });
+        }
+
+        const userData = tokenResult.data.userData;
+        let user;
+        try {
+            user = await prisma.ow_users.findUnique({
+                where: {id: userData.userid}
+            });
+        } catch (dbError) {
+            logger.error(`查询OAuth登录用户错误: ${dbError.message}`);
+            return res.status(500).json({
+                status: "error",
+                message: "查询用户信息失败"
+            });
+        }
+
+        if (!user) {
+            clearOAuthLoginTokenCookie(req, res);
+            clearBrowserBoundTransaction(req, res, oauthTransaction.state);
+            logger.error(`找不到OAuth临时令牌对应的用户: ${userData.userid}`);
+            return res.status(404).json({
+                status: "error",
+                message: "用户不存在"
+            });
+        }
+
+        let loginTokenResult;
+        try {
+            const userInfo = await tokenUtils.getUserInfoForToken(user, userData.email);
+            loginTokenResult = await tokenUtils.createUserLoginTokens(
+                user.id,
+                userInfo,
+                req.ip,
+                req.headers['user-agent'],
+                {
+                    recordLoginEvent: true,
+                    loginMethod: 'oauth'
+                }
+            );
+
+            if (!loginTokenResult.success) {
+                logger.error(`创建OAuth登录令牌失败: ${loginTokenResult.message}`);
+                return res.status(500).json({
+                    status: "error",
+                    message: "创建登录令牌失败"
+                });
+            }
+        } catch (tokenError) {
+            logger.error(`创建OAuth会话令牌失败: ${tokenError.message}`, tokenError);
+            return res.status(500).json({
+                status: "error",
+                message: "创建会话令牌失败"
+            });
+        }
+
+        try {
+            await invalidateTemporaryToken(token);
+        } catch (invalidateError) {
+            logger.warn(`OAuth临时令牌失效处理出错(非致命): ${invalidateError.message}`);
+        }
+
+        clearOAuthLoginTokenCookie(req, res);
+        clearBrowserBoundTransaction(req, res, oauthTransaction.state);
+        logger.info(`用户 ${user.id} 使用浏览器绑定的OAuth临时令牌登录成功`);
+
+        const response = tokenUtils.generateLoginResponse(user, loginTokenResult, userData.email);
+        return tokenUtils.respondWithBrowserAuthTokens(res, response);
+    } catch (error) {
+        logger.error(`处理OAuth临时令牌请求时出错: ${error.message}`, error);
+        return res.status(500).json({
+            status: "error",
+            message: "令牌验证过程中发生错误"
+        });
     }
 };
 

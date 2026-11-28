@@ -3,7 +3,6 @@
  * 主动拉取远程用户的帖子，处理提及、转推等引用的远程内容
  */
 
-import axios from 'axios';
 import { prisma } from '../prisma.js';
 import logger from '../logger.js';
 import { visibleWhere } from '../moderation/visibility.js';
@@ -11,6 +10,7 @@ import { AP_ACCEPT_TYPES, getInstanceDomain, getApEndpointBaseUrl } from './conf
 import { fetchRemoteActor, resolveWebFinger } from './federation.js';
 import { ensureProxyUser, findProxyUserByActorUrl, getRemoteUserInfo, REMOTE_USER_TYPE } from './remoteUser.js';
 import { isActorAllowed } from './federationConfig.js';
+import { federationGet } from './federationHttp.js';
 import { upsertTargetConfig, getTargetConfig } from './store.js';
 
 // target_type for remote posts
@@ -258,48 +258,25 @@ export async function fetchRemoteUserPosts(actorUrl, maxPosts = 50) {
  * @returns {object|null}
  */
 async function fetchApDocument(url) {
-    const seen = new Set();
-    let currentUrl = normalizeHttpUrl(url);
-    if (!currentUrl) {
+    const normalizedUrl = normalizeHttpUrl(url);
+    if (!normalizedUrl) {
         logger.warn(`[ap-fetch] AP 文档 URL 无效: ${url}`);
         return null;
     }
 
     try {
-        for (let i = 0; i <= AP_FETCH_REDIRECT_LIMIT; i++) {
-            if (seen.has(currentUrl)) {
-                logger.warn(`[ap-fetch] 重定向循环: ${currentUrl}`);
-                return null;
-            }
-            seen.add(currentUrl);
-
-            const response = await axios.get(currentUrl, {
-                headers: {
-                    'Accept': AP_ACCEPT_TYPES[0],
-                    'User-Agent': 'ZeroCat-ActivityPub/1.0',
-                },
-                timeout: AP_FETCH_TIMEOUT,
-                maxRedirects: 0,
-                validateStatus: status => (status >= 200 && status < 300) || [301, 302, 303, 307, 308].includes(status),
-            });
-
-            if ([301, 302, 303, 307, 308].includes(response.status)) {
-                const nextUrl = normalizeHttpUrl(response.headers?.location, currentUrl);
-                if (!nextUrl) {
-                    logger.warn(`[ap-fetch] 重定向缺少有效 location: ${currentUrl}`);
-                    return null;
-                }
-                currentUrl = nextUrl;
-                continue;
-            }
-
-            return response.data;
-        }
-
-        logger.warn(`[ap-fetch] 重定向次数超过上限: ${url}`);
-        return null;
+        const response = await federationGet(normalizedUrl, {
+            headers: {
+                'Accept': AP_ACCEPT_TYPES[0],
+                'User-Agent': 'ZeroCat-ActivityPub/1.0',
+            },
+            timeout: AP_FETCH_TIMEOUT,
+            maxRedirects: AP_FETCH_REDIRECT_LIMIT,
+            validateStatus: status => status >= 200 && status < 300,
+        });
+        return response.data;
     } catch (err) {
-        logger.warn(`[ap-fetch] 获取 AP 文档失败 ${currentUrl}:`, err.message);
+        logger.warn(`[ap-fetch] 获取 AP 文档失败 ${normalizedUrl}:`, err.message);
         return null;
     }
 }

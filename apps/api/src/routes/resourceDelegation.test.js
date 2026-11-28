@@ -10,6 +10,11 @@ const names = values => Object.fromEntries(values.map(name => [name, async (...a
     if (name === 'getSpaceByGuid') return { id: 3, owner_id: 9, status: 'active', cuid: 'space-cuid' };
     if (name === 'getComment') return { id: 11, comment: 'text', status: 'waiting', insertedAt: 'now' };
     if (name === 'updateComment') return { id: 11 };
+    if (name === 'createComment') return { id: 11, status: 'approved' };
+    if (name === 'verifyCaptcha') return { pass: true };
+    if (name === 'checkIpRate') return true;
+    if (name === 'checkDuplicate' || name === 'isSensitiveBanned') return false;
+    if (name === 'checkSensitiveWords') return { hit: false };
     return { id: name === 'getProjectList' ? 4 : 7 };
 }]));
 mock.module(url('../middleware/auth.js'), { namedExports: { parseToken: next, needLogin: next, needAdmin: next } });
@@ -31,7 +36,13 @@ mock.module(url('../controllers/blog/postsController.js'), { namedExports: names
 mock.module(url('../controllers/blog/tagsController.js'), { namedExports: names(['getTags']) });
 mock.module(url('../services/config/zcconfig.js'), { defaultExport: {} });
 mock.module(url('../services/queue/queueManager.js'), { defaultExport: { enqueueCommentNotification() {} } });
-mock.module(url('../services/commentService/walineAuth.js'), { namedExports: { createWalineToken() {} } });
+mock.module(url('../services/commentService/walineAuth.js'), { namedExports: {
+    createWalineToken() {},
+    isWalineScopeGranted(scopes, required) {
+        return Array.isArray(scopes) && (scopes.includes(required) || scopes.includes('comment:manage'));
+    },
+    async revokeWalineToken() {},
+} });
 mock.module(url('../services/commentService/spaceManager.js'), { namedExports: names(['createSpace', 'getSpaceByGuid', 'listSpaces',
     'updateSpace', 'deleteSpace', 'getSpaceConfig', 'updateSpaceConfig', 'getOrCreateSpaceUser', 'listSpaceUsers', 'updateSpaceUser',
     'getSpaceStats', 'adminListSpaces', 'adminGetSpace', 'adminUpdateSpaceStatus', 'getSpaceUser']) });
@@ -67,6 +78,15 @@ async function request(path, method = 'GET', body) {
     return fetch(`${origin}${path}`, { method, headers: { 'x-zerocat-delegation': '23', 'content-type': 'application/json' },
         ...(body ? { body: JSON.stringify(body) } : {}) });
 }
+
+test('cover authoring session requires the blog creation scope', async () => {
+    const response = await fetch(`${origin}/blog/authoring-session`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { status: 'success', data: { id: 5 } });
+    assert.equal(state.auth.length, 1);
+    assert.equal(state.auth[0].requiredScope, 'blog:create');
+    assert.equal(state.auth[0].allowDelegation, undefined);
+});
 
 for (const [path, method, body, scope, operation] of [
     ['/lists/listid/4', 'GET', null, 'list:4:read', 'getProjectList'],
@@ -135,4 +155,73 @@ test('revoked delegation fails route before a service receives a write', async (
     const response = await request('/lists/update/4', 'POST', { title: 'x' });
     assert.equal(response.status, 403);
     assert.equal(state.calls.length, 0);
+});
+
+function walineHandler(method, path) {
+    const layer = waline.stack.find(item => item.route?.path === path && item.route.methods[method]);
+    return layer.route.stack.at(-1).handle;
+}
+
+function directResponse() {
+    return {
+        statusCode: 200,
+        body: null,
+        status(value) { this.statusCode = value; return this; },
+        json(value) { this.body = value; return this; },
+    };
+}
+
+for (const method of ['put', 'delete']) {
+    test(`comment:create-only Waline identity cannot ${method} a comment`, async () => {
+        const req = {
+            body: { comment: 'changed' },
+            params: { id: '11' },
+            commentSpace: { id: 3 },
+            walineUser: { userId: 5, scopes: ['comment:create'] },
+        };
+        const res = directResponse();
+
+        await walineHandler(method, '/:spaceCuid/api/comment/:id')(req, res, error => { if (error) throw error; });
+
+        assert.equal(res.statusCode, 403);
+        assert.equal(res.body.errmsg, '令牌权限不足');
+        assert.equal(state.calls.some(call => call.name === `${method === 'put' ? 'update' : 'delete'}Comment`), false);
+    });
+}
+
+for (const [method, required, operation] of [
+    ['put', 'comment:update', 'updateComment'],
+    ['delete', 'comment:delete', 'deleteComment'],
+]) {
+    test(`${required} preserves the matching owner mutation`, async () => {
+        const req = {
+            body: { comment: 'changed' },
+            params: { id: '11' },
+            commentSpace: { id: 3 },
+            walineUser: { userId: 5, scopes: [required] },
+        };
+        const res = directResponse();
+
+        await walineHandler(method, '/:spaceCuid/api/comment/:id')(req, res, error => { if (error) throw error; });
+
+        assert.equal(res.statusCode, 200);
+        assert.equal(state.calls.some(call => call.name === operation), true);
+    });
+}
+
+test('comment:create preserves authenticated comment posting', async () => {
+    const req = {
+        body: { comment: 'new comment', url: '/article' },
+        headers: {},
+        ip: '127.0.0.1',
+        commentSpace: { id: 3, cuid: 'space-cuid' },
+        spaceConfig: {},
+        walineUser: { userId: 5, scopes: ['comment:create'] },
+    };
+    const res = directResponse();
+
+    await walineHandler('post', '/:spaceCuid/api/comment')(req, res, error => { if (error) throw error; });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(state.calls.some(call => call.name === 'createComment'), true);
 });

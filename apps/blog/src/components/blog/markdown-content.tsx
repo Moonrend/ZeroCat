@@ -1,7 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import rehypeRaw from "rehype-raw";
 import rehypeSlug from "rehype-slug";
 import rehypeHighlight from "rehype-highlight";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
@@ -111,10 +110,10 @@ export function MarkdownContent({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={markdownComponents}
+        skipHtml
         disallowedElements={["script", "iframe", "object", "embed"]}
         unwrapDisallowed
         rehypePlugins={[
-          rehypeRaw,
           rehypeSlug,
           [
             rehypeAutolinkHeadings,

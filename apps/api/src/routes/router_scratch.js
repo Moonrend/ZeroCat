@@ -1139,7 +1139,6 @@ router.get("/cloud/:projectid/history", needLogin, requireResource("project", "r
                 value: true,
                 actor_id: true,
                 actor_name: true,
-                ip: true,
                 created_at: true,
             },
         });
@@ -1166,7 +1165,7 @@ router.get("/cloud/:projectid/history", needLogin, requireResource("project", "r
             actor_id: row.actor_id,
             actor: row.actor_id ? userMap.get(row.actor_id) || null : null,
             actor_name: row.actor_id && !userMap.get(row.actor_id) ? null : row.actor_name,
-            ip: row.actor_id ? null : row.ip,
+            ip: null,
             created_at: row.created_at,
         }));
 

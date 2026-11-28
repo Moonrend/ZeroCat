@@ -1,7 +1,4 @@
 import crypto from "crypto";
-import dns from "dns/promises";
-import net from "net";
-import axios from "axios";
 import metascraper from "metascraper";
 import metascraperAuthor from "metascraper-author";
 import metascraperDate from "metascraper-date";
@@ -26,6 +23,11 @@ import logger from "./logger.js";
 import redisClient from "./redis.js";
 import memoryCache from "./memoryCache.js";
 import { prisma } from "./prisma.js";
+import {
+  fetchPageHtml,
+  normalizeInputUrl,
+  UrlPreviewError,
+} from "./postPreviewNetwork.js";
 
 const scraper = metascraper([
   metascraperAuthor(),
@@ -49,23 +51,11 @@ const scraper = metascraper([
   metascraperUrl(),
 ]);
 
-const PREVIEW_CACHE_VERSION = "v1";
+const PREVIEW_CACHE_VERSION = "v2";
 const PREVIEW_CACHE_KEY_PREFIX = `post:url_preview:${PREVIEW_CACHE_VERSION}:`;
 const PREVIEW_TTL_SUCCESS_SECONDS = 6 * 60 * 60;
 const PREVIEW_TTL_ERROR_SECONDS = 5 * 60;
-const MAX_HTML_BYTES = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 8000;
-
 const inFlightRequests = new Map();
-
-class UrlPreviewError extends Error {
-  constructor(message, statusCode = 400, code = "INVALID_REQUEST") {
-    super(message);
-    this.name = "UrlPreviewError";
-    this.statusCode = statusCode;
-    this.code = code;
-  }
-}
 
 function parseBooleanFlag(value) {
   if (value === undefined || value === null) return false;
@@ -77,125 +67,6 @@ function sanitizePreviewText(value, maxLen = 500) {
   const text = String(value).trim();
   if (!text) return null;
   return text.length > maxLen ? `${text.slice(0, maxLen - 1)}...` : text;
-}
-
-function normalizeInputUrl(rawUrl) {
-  if (!rawUrl || typeof rawUrl !== "string") {
-    throw new UrlPreviewError("url 不能为空", 400, "EMPTY_URL");
-  }
-
-  const trimmed = rawUrl.trim();
-  if (!trimmed) {
-    throw new UrlPreviewError("url 不能为空", 400, "EMPTY_URL");
-  }
-
-  let parsed;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    throw new UrlPreviewError("无效的 URL", 400, "INVALID_URL");
-  }
-
-  const protocol = parsed.protocol.toLowerCase();
-  if (protocol !== "http:" && protocol !== "https:") {
-    throw new UrlPreviewError("仅支持 http/https URL", 400, "UNSUPPORTED_PROTOCOL");
-  }
-
-  parsed.username = "";
-  parsed.password = "";
-  parsed.hash = "";
-
-  const removableTrackingParams = new Set([
-    "utm_source",
-    "utm_medium",
-    "utm_campaign",
-    "utm_term",
-    "utm_content",
-    "gclid",
-    "fbclid",
-    "mc_cid",
-    "mc_eid",
-  ]);
-
-  for (const key of [...parsed.searchParams.keys()]) {
-    if (removableTrackingParams.has(key.toLowerCase())) {
-      parsed.searchParams.delete(key);
-    }
-  }
-
-  return parsed.toString();
-}
-
-function isPrivateIPv4(ip) {
-  const segments = ip.split(".").map((v) => Number(v));
-  if (segments.length !== 4 || segments.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
-    return true;
-  }
-
-  if (segments[0] === 10) return true;
-  if (segments[0] === 127) return true;
-  if (segments[0] === 0) return true;
-  if (segments[0] === 169 && segments[1] === 254) return true;
-  if (segments[0] === 172 && segments[1] >= 16 && segments[1] <= 31) return true;
-  if (segments[0] === 192 && segments[1] === 168) return true;
-  if (segments[0] === 100 && segments[1] >= 64 && segments[1] <= 127) return true;
-  return false;
-}
-
-function isPrivateIpAddress(ip) {
-  const version = net.isIP(ip);
-  if (version === 4) {
-    return isPrivateIPv4(ip);
-  }
-
-  if (version === 6) {
-    const compact = ip.toLowerCase();
-    if (compact === "::1") return true;
-    if (compact.startsWith("fe80:")) return true;
-    if (compact.startsWith("fc") || compact.startsWith("fd")) return true;
-    if (compact.startsWith("::ffff:")) {
-      const ipv4 = compact.slice("::ffff:".length);
-      if (net.isIP(ipv4) === 4) {
-        return isPrivateIPv4(ipv4);
-      }
-    }
-    return false;
-  }
-
-  return true;
-}
-
-async function assertUrlIsPublicNetwork(urlString) {
-  const parsed = new URL(urlString);
-  const hostname = parsed.hostname.toLowerCase();
-
-  if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local")) {
-    throw new UrlPreviewError("不允许访问内网地址", 400, "BLOCKED_HOST");
-  }
-
-  if (net.isIP(hostname)) {
-    if (isPrivateIpAddress(hostname)) {
-      throw new UrlPreviewError("不允许访问内网地址", 400, "BLOCKED_IP");
-    }
-    return;
-  }
-
-  let lookupResults;
-  try {
-    lookupResults = await dns.lookup(hostname, { all: true, verbatim: true });
-  } catch {
-    throw new UrlPreviewError("域名解析失败", 400, "DNS_LOOKUP_FAILED");
-  }
-
-  if (!lookupResults || lookupResults.length === 0) {
-    throw new UrlPreviewError("域名解析失败", 400, "DNS_LOOKUP_FAILED");
-  }
-
-  for (const item of lookupResults) {
-    if (isPrivateIpAddress(item.address)) {
-      throw new UrlPreviewError("不允许访问内网地址", 400, "BLOCKED_IP");
-    }
-  }
 }
 
 function makeCacheKey(urlString) {
@@ -375,126 +246,7 @@ async function writeCachedPreview(cacheKey, payload, ttlSeconds, normalizedUrl) 
   }
 }
 
-async function fetchPageHtml(urlString) {
-  try {
-    const response = await axios.get(urlString, {
-      timeout: REQUEST_TIMEOUT_MS,
-      responseType: "stream",
-      maxRedirects: 5,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      validateStatus: (status) => status >= 200 && status < 400,
-      headers: {
-        "User-Agent": "ZeroCatBot/1.0 (+https://zerocat.top)",
-        Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-      },
-    });
-
-    const finalUrl = response?.request?.res?.responseUrl || urlString;
-    const stream = response?.data;
-    const chunks = [];
-    let bytesRead = 0;
-    let endedByLimit = false;
-    let headProbe = "";
-
-    await new Promise((resolve, reject) => {
-      let settled = false;
-
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-
-      const fail = (error) => {
-        if (settled) return;
-        settled = true;
-        reject(error);
-      };
-
-      stream.on("data", (chunk) => {
-        if (settled) return;
-
-        const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        const remaining = MAX_HTML_BYTES - bytesRead;
-
-        if (remaining <= 0) {
-          endedByLimit = true;
-          stream.destroy();
-          return finish();
-        }
-
-        if (chunkBuffer.length <= remaining) {
-          chunks.push(chunkBuffer);
-          bytesRead += chunkBuffer.length;
-        } else {
-          chunks.push(chunkBuffer.subarray(0, remaining));
-          bytesRead += remaining;
-          endedByLimit = true;
-          stream.destroy();
-          return finish();
-        }
-
-        headProbe = (headProbe + chunkBuffer.toString("utf8")).slice(-16384);
-        if (/<\/head\s*>/i.test(headProbe)) {
-          stream.destroy();
-          return finish();
-        }
-      });
-
-      stream.on("end", finish);
-      stream.on("close", finish);
-      stream.on("error", (error) => {
-        if (settled) return;
-        const isExpectedClose = endedByLimit || /premature close/i.test(String(error?.message || ""));
-        if (isExpectedClose) {
-          return finish();
-        }
-        fail(error);
-      });
-    });
-
-    const html = Buffer.concat(chunks).toString("utf8");
-    const contentType = String(response.headers?.["content-type"] || "").toLowerCase();
-
-    if (!html) {
-      throw new UrlPreviewError("目标页面无可解析内容", 422, "EMPTY_HTML");
-    }
-
-    if (contentType && !contentType.includes("text/html") && !html.includes("<html")) {
-      throw new UrlPreviewError("目标 URL 不是可预览网页", 422, "UNSUPPORTED_CONTENT_TYPE");
-    }
-
-    return {
-      html,
-      finalUrl,
-      contentType,
-    };
-  } catch (error) {
-    if (error instanceof UrlPreviewError) {
-      throw error;
-    }
-
-    if (String(error?.message || "").includes("maxContentLength")) {
-      throw new UrlPreviewError("目标页面体积过大", 422, "CONTENT_TOO_LARGE");
-    }
-
-    if (error?.code === "ECONNABORTED") {
-      throw new UrlPreviewError("抓取超时，请稍后重试", 504, "FETCH_TIMEOUT");
-    }
-
-    const upstreamStatus = Number(error?.response?.status || 0);
-    if (upstreamStatus === 403 || upstreamStatus === 429) {
-      throw new UrlPreviewError("目标站点拒绝抓取，请稍后重试", 502, "UPSTREAM_BLOCKED");
-    }
-    logger.error(error);
-    throw new UrlPreviewError("抓取预览失败", 502, "FETCH_FAILED");
-  }
-}
-
 async function scrapeUrlPreview(urlString) {
-  await assertUrlIsPublicNetwork(urlString);
-
   const { html, finalUrl, contentType } = await fetchPageHtml(urlString);
   const metadata = await scraper({ html, url: finalUrl });
   const preview = buildPreviewPayload({

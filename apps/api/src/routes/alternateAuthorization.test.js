@@ -49,7 +49,10 @@ mock.module('../services/prisma.js', { namedExports: { prisma: {
     },
     ow_target_configs: { findMany: async () => [] },
     ow_events: { findMany: async () => [{ id: 1, actor_id: 3, event_data: { user: 'old-hidden-profile', value: '5' } }] },
-    project_clouddata_history: { findMany: async () => [{ id: 1, actor_id: 3, actor_name: 'old-hidden-profile', value: '5' }] },
+    project_clouddata_history: { findMany: async query => {
+        state.historyQuery = query;
+        return state.historyRows;
+    } },
     ow_scratch_extensions: {
         findMany: async () => { state.extensionReads++; return structuredClone(state.extensionRows); },
         findFirst: async () => { state.extensionReads++; return structuredClone(state.extension); },
@@ -74,6 +77,7 @@ beforeEach(() => {
     global.config = { 's3.staticurl': 'https://static.example' };
     const project = { id: 7, authorid: 9, state: 'public', type: 'scratch', default_branch: 'main', source: 'public-file', devsource: 'private-file' };
     Object.assign(state, { project, hidden: false, hiddenProfile: false, denied: false, fileReads: 0, extensionReads: 0, authorizations: [],
+        historyQuery: null, historyRows: [{ id: 1, actor_id: 3, actor_name: 'old-hidden-profile', value: '5' }],
         sampleReads: 0, profileBatches: 0, visibleSamples: [], extensionRows: [], readSources: [],
         signedPayload: null, signOptions: null, verifyOptions: null,
         signedToken: { type: 'project', data: { action: 'read', projectid: 7, viewerid: 3 } },
@@ -190,6 +194,20 @@ for (const [path, key, actorName] of [
         assert.equal(res.body[key][0].value, '5');
     });
 }
+
+test('cloud history never exposes stored IP addresses through project read access', async () => {
+    state.historyRows = [{
+        id: 2, method: 'set', name: '☁ score', value: '5', actor_id: null,
+        actor_name: '[匿名]visitor', ip: '203.0.113.42', created_at: '2026-01-01T00:00:00.000Z',
+    }];
+    const res = response({ userid: 3, tokenType: 'session', scopes: [] });
+    await handler(scratch, '/cloud/:projectid/history')({ params: { projectid: '7' }, query: {} }, res, next);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.project_id, '7');
+    assert.equal(state.historyQuery.select.ip, undefined);
+    assert.deepEqual(res.body.history, [{ ...state.historyRows[0], actor: null, ip: null }]);
+    assert.equal(res.body.next_since, 2);
+});
 
 test('extension management reuses the authorized extension within the same request', async () => {
     state.extension.commit = 'latest';

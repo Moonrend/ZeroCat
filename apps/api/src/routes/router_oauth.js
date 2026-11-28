@@ -22,7 +22,16 @@ import multer from "multer";
 import { handleAssetUpload } from "../services/assets.js";
 import { requireSudo } from "../middleware/sudo.js";
 const router = Router();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 10 * 1024 * 1024,
+        files: 1,
+        fieldSize: 64 * 1024,
+        fields: 0,
+        parts: 1,
+    },
+});
 
 function requireInteractiveSession(req, res, next) {
     if (res.locals.tokenType !== "session") {
